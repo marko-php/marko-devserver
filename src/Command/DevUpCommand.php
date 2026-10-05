@@ -20,7 +20,12 @@ use Marko\DevServer\Process\ProcessEntry;
 use Marko\DevServer\Process\ProcessManager;
 
 /** @noinspection PhpUnused */
-#[Command(name: 'dev:up', description: 'Start the development environment', aliases: ['up'])]
+#[Command(
+    name: 'dev:up',
+    description: 'Start the development environment',
+    aliases: ['up'],
+    flags: ['foreground', 'f', 'detach', 'd'],
+)]
 readonly class DevUpCommand implements CommandInterface
 {
     public function __construct(

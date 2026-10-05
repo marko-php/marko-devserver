@@ -242,6 +242,12 @@ it('has Command attribute with name dev:up and alias up', function (): void {
         ->and($attr->aliases)->toContain('up');
 });
 
+it('declares its boolean flags on the Command attribute', function (): void {
+    $attribute = new ReflectionClass(DevUpCommand::class)->getAttributes(Command::class)[0]->newInstance();
+
+    expect($attribute->flags)->toBe(['foreground', 'f', 'detach', 'd']);
+});
+
 it('starts PHP server on configured port', function (): void {
     ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.port' => 8000]);
     ['output' => $output] = createMemoryOutput();
