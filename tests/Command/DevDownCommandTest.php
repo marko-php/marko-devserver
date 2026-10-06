@@ -282,17 +282,27 @@ it('stops docker via config even when PID file has no docker entry', function ()
 it('kills entire process group when stopping a process', function (): void {
     ['command' => $command, 'pidFile' => $pidFile, 'tmpDir' => $tmpDir] = createDevDownCommand();
 
-    // Start a parent process that spawns a child, both in their own process group
-    $php = PHP_BINARY;
-    $script = base64_encode('posix_setsid(); $pid = pcntl_fork(); if ($pid === 0) { sleep(60); exit(0); } sleep(60);');
+    // Start a parent process that spawns a child, both in their own process group.
+    // The child writes its PID to a marker file once the fork has completed.
+    $marker = devserverMarkerPath();
+    $script = base64_encode(
+        'posix_setsid(); $pid = pcntl_fork(); if ($pid === 0) { file_put_contents('
+        . var_export($marker, true)
+        . ', (string) getmypid()); sleep(60); exit(0); } sleep(60);',
+    );
+    // Array form execs PHP directly, so the reported PID is PHP's rather than a wrapper shell's
     $proc = proc_open(
-        "$php -r 'eval(base64_decode(\"$script\"));'",
+        [PHP_BINARY, '-r', 'eval(base64_decode("' . $script . '"));'],
         [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
         $pipes,
     );
-    $status = proc_get_status($proc);
-    $parentPid = $status['pid'];
-    usleep(200000); // let fork complete
+    $parentPid = proc_get_status($proc)['pid'];
+
+    expect(devserverWaitUntil(fn (): bool => devserverMarkerPid($marker) > 0))->toBeTrue('child was forked');
+    $childPid = devserverMarkerPid($marker);
+    @unlink($marker);
+
+    expect(posix_getpgid($childPid))->toBe($parentPid);
 
     $pidFile->write([
         new ProcessEntry('worker', $parentPid, 'sleep 60', 0, date('c')),
@@ -302,24 +312,13 @@ it('kills entire process group when stopping a process', function (): void {
     $output = new Output($stream);
     $command->execute(new Input([]), $output);
 
-    usleep(100000); // let signals propagate
+    // proc_get_status() reaps the parent once it exits, so its zombie never keeps the group alive
+    expect(devserverWaitUntil(fn (): bool => !proc_get_status($proc)['running']))->toBeTrue('parent exited')
+        ->and(devserverWaitUntil(fn (): bool => !$pidFile->isProcessGroupRunning($parentPid)))->toBeTrue(
+            'group exited',
+        );
 
     proc_close($proc);
-
-    $groupRunning = true;
-    for ($i = 0; $i < 10; $i++) {
-        $groupRunning = $pidFile->isProcessGroupRunning($parentPid);
-        if ($groupRunning === false) {
-            break;
-        }
-
-        usleep(50000);
-    }
-
-    // Reap the parent process before asserting so zombie cleanup does not
-    // make the process group appear alive briefly on Linux.
-    expect($groupRunning)->toBeFalse();
-
     devDownRemoveDir($tmpDir);
 });
 

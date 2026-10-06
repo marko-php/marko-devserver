@@ -8,7 +8,7 @@ use Marko\DevServer\Process\ProcessManager;
 
 it('starts a process with proc_open', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid = $manager->start('echo', 'echo hello');
 
@@ -20,7 +20,7 @@ it('starts a process with proc_open', function (): void {
 
 it('stops a running process', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('sleep', 'sleep 5');
     expect($manager->isRunning('sleep'))->toBeTrue();
@@ -32,7 +32,7 @@ it('stops a running process', function (): void {
 
 it('stops all managed processes', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('sleep1', 'sleep 5');
     $manager->start('sleep2', 'sleep 5');
@@ -47,7 +47,7 @@ it('stops all managed processes', function (): void {
 
 it('returns process PIDs after starting', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid1 = $manager->start('sleep1', 'sleep 5');
     $pid2 = $manager->start('sleep2', 'sleep 5');
@@ -61,7 +61,7 @@ it('returns process PIDs after starting', function (): void {
 
 it('detects when a process exits unexpectedly', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('echo', 'echo hello');
 
@@ -84,9 +84,100 @@ it('detects a command that fails after the default probe window when given a lon
     $output = new Output(fopen('php://memory', 'r+'));
     $manager = new ProcessManager($output, startProbeSeconds: 5.0);
 
-    // Exits with "command not found" well after the 150ms default probe window
-    expect(fn () => $manager->start('slow-fail', 'sleep 0.4; exit 127'))
+    // Exits with "command not found" well after the 0.5s default probe window
+    expect(fn () => $manager->start('slow-fail', 'sleep 0.8; exit 127'))
         ->toThrow(DevServerException::class);
+});
+
+it('reports the exit code of a command that fails within the probe window', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 5.0);
+
+    expect(fn () => $manager->start('slow-fail', 'sleep 0.3; exit 127'))
+        ->toThrow(DevServerException::class, 'exited with code 127');
+});
+
+it('watches a running process for half a second by default', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output);
+
+    $start = microtime(true);
+    $manager->start('sleep', 'sleep 30');
+    $elapsed = microtime(true) - $start;
+
+    $manager->stopAll();
+
+    expect($elapsed)->toBeGreaterThanOrEqual(0.5);
+});
+
+it('fails with processFailedToStart for a missing executable without relying on the probe window', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    // A zero probe window: only the pre-flight lookup can catch the missing executable
+    $manager = new ProcessManager($output, startProbeSeconds: 0.0);
+
+    expect(fn () => $manager->start('missing', 'nonexistent-binary-abc123 --watch'))
+        ->toThrow(DevServerException::class, "Failed to start process 'missing'")
+        ->and($manager->getPids())->toBeEmpty();
+});
+
+it('fails with processFailedToStart for a path that is not executable', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.0);
+    $script = devserverMarkerPath();
+    file_put_contents($script, "#!/bin/sh\nsleep 30\n");
+    chmod($script, 0644);
+
+    try {
+        expect(fn () => $manager->start('not-executable', "$script --flag"))
+            ->toThrow(DevServerException::class, 'is not executable');
+    } finally {
+        unlink($script);
+    }
+});
+
+it('resolves the executable after leading environment assignments and env', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.0);
+
+    expect(fn () => $manager->start('assigned', 'FOO=bar nonexistent-binary-abc123'))
+        ->toThrow(DevServerException::class, "'nonexistent-binary-abc123' was not found")
+        ->and(fn () => $manager->start('env', 'env PHP_CLI_SERVER_WORKERS=4 nonexistent-binary-abc123 -S'))
+        ->toThrow(DevServerException::class, "'nonexistent-binary-abc123' was not found");
+
+    $pid = $manager->start('env-ok', 'env FOO=bar sleep 30');
+
+    expect($manager->isRunning('env-ok'))->toBeTrue()
+        ->and($pid)->toBeGreaterThan(0);
+
+    $manager->stopAll();
+});
+
+it('leaves shell syntax it cannot resolve to the runtime probe', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.0);
+
+    // Builtins, reserved words, quoting and expansions are not resolved up front
+    $manager->start('builtin', "trap '' TERM; sleep 30");
+    $manager->start('reserved', 'if true; then sleep 30; fi');
+    $manager->start('quoted', '"sleep" 30');
+    $manager->start('expanded', '$(echo sleep) 30');
+
+    expect($manager->getPids())->toHaveCount(4);
+
+    $manager->stopAll();
+});
+
+it('names the reason a process failed to start in the exception', function (): void {
+    $exception = DevServerException::processFailedToStart(
+        'vite',
+        'npx vite',
+        "Executable 'npx' was not found in PATH",
+    );
+
+    expect($exception->getMessage())
+        ->toBe("Failed to start process 'vite' with command: npx vite (Executable 'npx' was not found in PATH)")
+        ->and(DevServerException::processFailedToStart('vite', 'npx vite')->getMessage())
+        ->toBe("Failed to start process 'vite' with command: npx vite");
 });
 
 it('returns from start as soon as the process exits within the probe window', function (): void {
@@ -104,7 +195,7 @@ it('returns from start as soon as the process exits within the probe window', fu
 it('prefixes output lines with process name', function (): void {
     $stream = fopen('php://memory', 'r+');
     $output = new Output($stream);
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->writePrefix('php', 'Server started on port 8000');
 
@@ -117,7 +208,7 @@ it('prefixes output lines with process name', function (): void {
 it('streams prefixed output in foreground mode until processes exit', function (): void {
     $stream = fopen('php://memory', 'r+');
     $output = new Output($stream);
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('echo', 'echo "hello from echo"');
     $manager->runForeground();
@@ -131,7 +222,7 @@ it('streams prefixed output in foreground mode until processes exit', function (
 it('streams output from multiple processes in foreground mode', function (): void {
     $stream = fopen('php://memory', 'r+');
     $output = new Output($stream);
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('greet', 'echo "hi there"');
     $manager->start('count', 'echo "one two three"');
@@ -147,7 +238,7 @@ it('streams output from multiple processes in foreground mode', function (): voi
 it('returns when all foreground processes have exited', function (): void {
     $stream = fopen('php://memory', 'r+');
     $output = new Output($stream);
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('fast', 'echo done');
 
@@ -160,7 +251,7 @@ it('returns when all foreground processes have exited', function (): void {
 it('reports process exit with success status', function (): void {
     $stream = fopen('php://memory', 'r+');
     $output = new Output($stream);
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('task', 'echo done');
     $manager->runForeground();
@@ -174,7 +265,7 @@ it('reports process exit with success status', function (): void {
 it('reports process exit with failure status', function (): void {
     $stream = fopen('php://memory', 'r+');
     $output = new Output($stream);
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $manager->start('fail', 'sh -c "exit 1"');
     $manager->runForeground();
@@ -187,7 +278,7 @@ it('reports process exit with failure status', function (): void {
 
 it('captures the actual command PID not the shell wrapper PID', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid = $manager->start('sleep', 'sleep 10');
 
@@ -201,7 +292,7 @@ it('captures the actual command PID not the shell wrapper PID', function (): voi
 
 it('reports running processes as running in dev:status', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid = $manager->start('sleep', 'sleep 10');
 
@@ -214,7 +305,7 @@ it('reports running processes as running in dev:status', function (): void {
 
 it('reports stopped processes as stopped in dev:status', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid = $manager->start('sleep', 'sleep 10');
     $manager->stop('sleep');
@@ -226,7 +317,7 @@ it('reports stopped processes as stopped in dev:status', function (): void {
 
 it('correctly tracks PID for long-running processes', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid = $manager->start('sleep', 'sleep 30');
 
@@ -241,7 +332,7 @@ it('correctly tracks PID for long-running processes', function (): void {
 
 it('makes the reported PID the leader of its own process group', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     // Shells that fork instead of exec'ing a lone command (e.g. dash as /bin/sh) must not
     // leave a wrapper shell as the reported PID: stop() signals that PID's group
@@ -254,7 +345,7 @@ it('makes the reported PID the leader of its own process group', function (): vo
 
 it('leaves no process in the group once stop returns', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $pid = $manager->start('sleep', 'sleep 30');
     expect(devserverWaitUntil(fn (): bool => devserverProcessGroupAlive($pid)))->toBeTrue();
@@ -267,14 +358,14 @@ it('leaves no process in the group once stop returns', function (): void {
 
 it('stops child processes that share the process group', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    $manager = new ProcessManager($output, startProbeSeconds: 0.15);
 
     $marker = devserverMarkerPath();
 
     // The shell leader backgrounds a child in the same process group and records its PID
     $pid = $manager->start('tree', "sleep 30 & echo \$! > $marker; wait");
-    expect(devserverWaitUntil(fn (): bool => (int) @file_get_contents($marker) > 0))->toBeTrue();
-    $childPid = (int) file_get_contents($marker);
+    expect(devserverWaitUntil(fn (): bool => devserverMarkerPid($marker) > 0))->toBeTrue();
+    $childPid = devserverMarkerPid($marker);
     @unlink($marker);
 
     expect(posix_kill($childPid, 0))->toBeTrue();
@@ -361,4 +452,272 @@ it('creates a loud exception when a process cannot be stopped', function (): voi
         ->and($exception->getMessage())->toContain('12345')
         ->and($exception->getContext())->not->toBeEmpty()
         ->and($exception->getSuggestion())->toContain('kill -9 -12345');
+});
+
+/**
+ * Stop a detached process group and wait until it is gone, so no process outlives the test.
+ */
+function devserverStopDetached(int $pid): void
+{
+    @posix_kill(-$pid, SIGTERM);
+
+    if (!devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid))) {
+        @posix_kill(-$pid, SIGKILL);
+        devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid));
+    }
+}
+
+/**
+ * A fresh, empty directory for the per-start status files of detached processes.
+ */
+function devserverStatusDirectory(): string
+{
+    $dir = devserverMarkerPath();
+    mkdir($dir);
+
+    return $dir;
+}
+
+/**
+ * The `tail -f /dev/null` processes in the test runner's own process group.
+ */
+function devserverKeepAlivesInOwnGroup(): int
+{
+    $own = posix_getpgrp();
+    $count = 0;
+
+    foreach (explode("\n", (string) shell_exec('ps -axo pgid=,command=')) as $line) {
+        if (preg_match('/\A\s*(\d+)\s+(.*)\z/', $line, $matches) === 1
+            && (int) $matches[1] === $own
+            && str_starts_with($matches[2], 'tail -f /dev/null')
+        ) {
+            $count++;
+        }
+    }
+
+    return $count;
+}
+
+it('starts a detached process that keeps running after startDetached returns', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.2);
+
+    $pid = $manager->startDetached('sleep', 'sleep 30');
+
+    try {
+        expect($pid)->toBeGreaterThan(0)
+            ->and($manager->getPid('sleep'))->toBe($pid)
+            ->and(devserverProcessGroupAlive($pid))->toBeTrue();
+    } finally {
+        devserverStopDetached($pid);
+    }
+});
+
+it('makes the detached PID the leader of a process group containing the command', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.2);
+    $marker = devserverMarkerPath();
+
+    $pid = $manager->startDetached('tree', "sleep 30 & echo \$! > $marker; wait");
+
+    try {
+        expect(devserverWaitUntil(fn (): bool => devserverMarkerPid($marker) > 0))->toBeTrue();
+        $childPid = devserverMarkerPid($marker);
+
+        expect(posix_getpgid($pid))->toBe($pid)
+            ->and(posix_getpgid($childPid))->toBe($pid);
+    } finally {
+        devserverStopDetached($pid);
+        @unlink($marker);
+    }
+
+    expect(devserverProcessGroupAlive($pid))->toBeFalse();
+});
+
+it('keeps stdin open for a detached process until it exits', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.3);
+
+    // cat exits as soon as its stdin reaches end-of-file, which startDetached() would report
+    $pid = $manager->startDetached('reader', 'cat > /dev/null');
+
+    devserverStopDetached($pid);
+
+    expect(devserverProcessGroupAlive($pid))->toBeFalse();
+});
+
+it('reports a detached command that exits 127 after 300ms as processFailedToStart', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    // startDetached() returns as soon as the command exits, so a long window costs nothing here
+    $manager = new ProcessManager($output, startProbeSeconds: 5.0);
+
+    expect(fn () => $manager->startDetached('slow-fail', 'sleep 0.3; exit 127'))
+        ->toThrow(
+            DevServerException::class,
+            "Failed to start process 'slow-fail' with command: sleep 0.3; exit 127 (exited with code 127)",
+        )
+        ->and($manager->getPid('slow-fail'))->toBeNull();
+});
+
+it(
+    'reports a detached command that exits with a non-127 code inside the probe window as processFailedToStart',
+    function (): void {
+        $output = new Output(fopen('php://memory', 'r+'));
+        $manager = new ProcessManager($output, startProbeSeconds: 5.0);
+
+        expect(fn () => $manager->startDetached('busy-port', 'sleep 0.2; exit 1'))
+            ->toThrow(DevServerException::class, 'exited with code 1');
+    },
+);
+
+it('reports a missing detached executable as processFailedToStart', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 0.0);
+
+    expect(fn () => $manager->startDetached('missing', 'nonexistent-binary-abc123 --watch'))
+        ->toThrow(DevServerException::class, "Executable 'nonexistent-binary-abc123' was not found in PATH");
+});
+
+it('leaves no keep-alive or status file behind once a detached process is stopped', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $statusDirectory = devserverStatusDirectory();
+    $manager = new ProcessManager($output, startProbeSeconds: 0.2, statusDirectory: $statusDirectory);
+    $keepAlivesBefore = devserverKeepAlivesInOwnGroup();
+
+    $pid = $manager->startDetached('sleep', 'sleep 30');
+
+    expect(glob("$statusDirectory/*"))->toBe([]);
+
+    devserverStopDetached($pid);
+
+    expect(devserverKeepAlivesInOwnGroup())->toBe($keepAlivesBefore);
+
+    // A process that exits on its own after the probe window cannot write into the removed status dir
+    $marker = devserverMarkerPath();
+    $pid = $manager->startDetached('short', "touch $marker; sleep 0.5");
+
+    try {
+        expect(devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid)))->toBeTrue()
+            ->and(glob("$statusDirectory/*"))->toBe([]);
+    } finally {
+        devserverStopDetached($pid);
+        @unlink($marker);
+        rmdir($statusDirectory);
+    }
+});
+
+/**
+ * Listen on an ephemeral port, so tests never collide under --parallel.
+ *
+ * @return array{0: resource, 1: int}
+ */
+function devserverListen(string $address = '127.0.0.1'): array
+{
+    $server = stream_socket_server("tcp://$address:0", $errno, $errstr);
+
+    if ($server === false) {
+        throw new RuntimeException("Cannot listen on $address: $errstr");
+    }
+
+    $name = (string) stream_socket_get_name($server, false);
+
+    return [$server, (int) substr($name, (int) strrpos($name, ':') + 1)];
+}
+
+/**
+ * A port that was free a moment ago.
+ */
+function devserverFreePort(): int
+{
+    [$server, $port] = devserverListen();
+    fclose($server);
+
+    return $port;
+}
+
+it('reports a port another process is listening on as unavailable', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')));
+    [$server, $port] = devserverListen();
+
+    try {
+        expect($manager->isPortAvailable('127.0.0.1', $port))->toBeFalse()
+            ->and($manager->isPortAvailable('localhost', $port))->toBeFalse();
+    } finally {
+        fclose($server);
+    }
+});
+
+it('reports a port held on the wildcard address as unavailable when probing loopback', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')));
+    [$server, $port] = devserverListen('0.0.0.0');
+
+    try {
+        expect($manager->isPortAvailable('127.0.0.1', $port))->toBeFalse()
+            ->and($manager->isPortAvailable('0.0.0.0', $port))->toBeFalse();
+    } finally {
+        fclose($server);
+    }
+});
+
+it('does not report an unbindable non-local host as a port in use', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')));
+
+    // TEST-NET-1 (RFC 5737) is never assigned to a local interface, so binding fails without the port being taken
+    expect($manager->isPortAvailable('192.0.2.1', devserverFreePort()))->toBeTrue();
+});
+
+it('reports a free port as available', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')));
+
+    expect($manager->isPortAvailable('127.0.0.1', devserverFreePort()))->toBeTrue();
+});
+
+it('returns true as soon as the server accepts connections', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), serverReadyTimeoutSeconds: 10.0);
+    $port = devserverFreePort();
+    $docroot = devserverStatusDirectory();
+
+    $manager->start('php', 'php -S 127.0.0.1:' . $port . ' -t ' . escapeshellarg($docroot));
+
+    try {
+        $start = microtime(true);
+
+        expect($manager->waitUntilAccepting('php', '127.0.0.1', $port))->toBeTrue()
+            ->and(microtime(true) - $start)->toBeLessThan(5.0)
+            ->and($manager->isRunning('php'))->toBeTrue();
+    } finally {
+        $manager->stopAll();
+        rmdir($docroot);
+    }
+});
+
+it('returns false when the process exits before accepting connections', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), serverReadyTimeoutSeconds: 10.0);
+    $port = devserverFreePort();
+
+    $manager->start('php', 'sleep 0.2; exit 1');
+
+    $start = microtime(true);
+
+    expect($manager->waitUntilAccepting('php', '127.0.0.1', $port))->toBeFalse()
+        ->and(microtime(true) - $start)->toBeLessThan(5.0);
+
+    $manager->stopAll();
+});
+
+it('throws when the server neither accepts connections nor exits before the timeout', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), serverReadyTimeoutSeconds: 0.3);
+    $port = devserverFreePort();
+
+    $manager->start('php', 'sleep 30');
+
+    try {
+        expect(fn () => $manager->waitUntilAccepting('php', '127.0.0.1', $port))
+            ->toThrow(
+                DevServerException::class,
+                "PHP server did not accept connections on 127.0.0.1:$port within 0.3 seconds",
+            );
+    } finally {
+        $manager->stopAll();
+    }
 });

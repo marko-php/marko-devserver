@@ -161,20 +161,22 @@ it('detects a process group as running when parent died but child lives', functi
         [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
         $pipes,
     );
-    $status = proc_get_status($proc);
-    $parentPid = $status['pid'];
+    $parentPid = proc_get_status($proc)['pid'];
 
-    // Wait for parent to exit
-    usleep(200000);
+    // The parent exits right after forking, so once it has exited the child exists.
+    // proc_get_status() reaps the parent, so it is not counted as a zombie group member.
+    expect(devserverWaitUntil(fn (): bool => !proc_get_status($proc)['running']))->toBeTrue('parent exited');
     proc_close($proc);
 
     // Parent is dead, but child is still alive in the same process group
     // isRunning now checks both individual PID and process group
-    expect($pidFile->isProcessGroupRunning($parentPid))->toBeTrue('process group has alive members')
+    expect(posix_kill($parentPid, 0))->toBeFalse('parent is gone')
+        ->and($pidFile->isProcessGroupRunning($parentPid))->toBeTrue('process group has alive members')
         ->and($pidFile->isRunning($parentPid))->toBeTrue('isRunning detects group members');
 
-    // Clean up: kill the process group
-    posix_kill(-$parentPid, SIGTERM);
+    // Clean up: kill the process group and wait for it to go
+    posix_kill(-$parentPid, SIGKILL);
+    expect(devserverWaitUntil(fn (): bool => !$pidFile->isProcessGroupRunning($parentPid)))->toBeTrue();
     removeDir($tmpDir);
 });
 

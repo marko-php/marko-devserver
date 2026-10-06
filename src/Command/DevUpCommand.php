@@ -89,6 +89,11 @@ readonly class DevUpCommand implements CommandInterface
             );
         }
 
+        // Fail before starting anything if the PHP server's port is already taken
+        if (!$this->processManager->isPortAvailable($host, $port)) {
+            throw DevServerException::portInUse($port);
+        }
+
         $output->writeLine('Starting development environment...');
 
         $entries = [];
@@ -173,13 +178,11 @@ readonly class DevUpCommand implements CommandInterface
         $output->writeLine("  Starting PHP server: php -S $host:$port");
         $pid = $startProcess('php', $phpCommand);
 
-        // In foreground mode, verify PHP server is alive — if it died, port is likely in use.
-        // In detached mode, startDetached() already checks for immediate failure.
-        if (!$detach) {
-            usleep(100000); // 100ms — give the server time to attempt binding
-            if (!$this->processManager->isRunning('php')) {
-                throw DevServerException::portInUse($port);
-            }
+        // In foreground mode, wait until the PHP server accepts connections. If it exits
+        // first, it lost the bind (the port was taken after the check above).
+        // In detached mode, startDetached() already fails on any exit during its probe window.
+        if (!$detach && !$this->processManager->waitUntilAccepting('php', $host, $port)) {
+            throw DevServerException::portInUse($port);
         }
 
         $entries[] = new ProcessEntry(

@@ -19,6 +19,12 @@ class ProcessManager
 
     private const int POLL_INTERVAL_MICROS = 10_000;
 
+    /** Words the shell treats as syntax rather than a command to look up. */
+    private const array SHELL_RESERVED_WORDS = [
+        '!', '{', '}', '[[', ']]', 'case', 'do', 'done', 'elif', 'else', 'esac',
+        'fi', 'for', 'function', 'if', 'in', 'select', 'then', 'time', 'until', 'while',
+    ];
+
     /** @var array<string, array{resource: resource, pipes: array<int, resource>}> */
     private array $processes = [];
 
@@ -27,16 +33,145 @@ class ProcessManager
 
     /**
      * @param float $stopTimeoutSeconds Grace period stop() gives a process group to exit after SIGTERM before sending SIGKILL
-     * @param float $startProbeSeconds How long start() watches a new process for an immediate "not found"/"not executable" exit
+     * @param float $startProbeSeconds How long start() and startDetached() watch a new process for an early exit
+     * @param string|null $statusDirectory Where startDetached() keeps the short-lived exit status files (default: the system temp dir)
+     * @param float $serverReadyTimeoutSeconds How long waitUntilAccepting() waits for a server to accept connections
      */
     public function __construct(
         private readonly Output $output,
         private readonly float $stopTimeoutSeconds = 3.0,
-        private readonly float $startProbeSeconds = 0.15,
+        private readonly float $startProbeSeconds = 0.5,
+        private readonly ?string $statusDirectory = null,
+        private readonly float $serverReadyTimeoutSeconds = 10.0,
     ) {}
 
     /**
+     * Check whether a server could listen on the given host and port.
+     *
+     * A port is in use when something already accepts connections on it, or when
+     * binding it fails with "address already in use". Any other bind failure (such
+     * as a host that is not a local address) is left for the server to report.
+     */
+    public function isPortAvailable(
+        string $host,
+        int $port,
+    ): bool {
+        if ($this->accepts($host, $port, 0.2)) {
+            return false;
+        }
+
+        $errno = 0;
+        $errstr = '';
+        $address = 'tcp://' . $this->hostForUri($host) . ":$port";
+        $server = $this->withoutWarnings(
+            function () use ($address, &$errno, &$errstr): mixed {
+                return stream_socket_server($address, $errno, $errstr);
+            },
+        );
+
+        if (is_resource($server)) {
+            fclose($server);
+
+            return true;
+        }
+
+        $addressInUse = defined('SOCKET_EADDRINUSE') ? SOCKET_EADDRINUSE : null;
+
+        return !($errno === $addressInUse || stripos($errstr, 'address already in use') !== false);
+    }
+
+    /**
+     * Wait until a started server accepts connections on the given host and port.
+     *
+     * @return bool True once a connection is accepted, false if the process exited first
+     * @throws DevServerException If the server neither accepts connections nor exits before the timeout
+     */
+    public function waitUntilAccepting(
+        string $name,
+        string $host,
+        int $port,
+    ): bool {
+        $deadline = microtime(true) + $this->serverReadyTimeoutSeconds;
+
+        while (true) {
+            if (!$this->isRunning($name)) {
+                return false;
+            }
+
+            if ($this->accepts($host, $port, min(0.1, max(0.01, $deadline - microtime(true))))) {
+                return true;
+            }
+
+            if (microtime(true) >= $deadline) {
+                throw DevServerException::serverNotReady($host, $port, $this->serverReadyTimeoutSeconds);
+            }
+
+            usleep(self::POLL_INTERVAL_MICROS);
+        }
+    }
+
+    /**
+     * Whether something accepts a TCP connection on the host and port.
+     *
+     * Wildcard addresses are probed through loopback, since nothing can connect to them directly.
+     */
+    private function accepts(
+        string $host,
+        int $port,
+        float $timeoutSeconds,
+    ): bool {
+        $connectHost = match (trim($host, '[]')) {
+            '0.0.0.0' => '127.0.0.1',
+            '::' => '::1',
+            default => $host,
+        };
+
+        $connection = $this->withoutWarnings(fn (): mixed => stream_socket_client(
+            'tcp://' . $this->hostForUri($connectHost) . ":$port",
+            timeout: $timeoutSeconds,
+        ));
+
+        if (!is_resource($connection)) {
+            return false;
+        }
+
+        fclose($connection);
+
+        return true;
+    }
+
+    /**
+     * Run an operation whose failure is an expected answer, not an error worth a warning.
+     *
+     * @template T
+     * @param callable(): T $operation
+     * @return T
+     */
+    private function withoutWarnings(callable $operation): mixed
+    {
+        set_error_handler(static fn (): bool => true);
+
+        try {
+            return $operation();
+        } finally {
+            restore_error_handler();
+        }
+    }
+
+    /**
+     * Bracket IPv6 literals so they can be used in a stream URI.
+     */
+    private function hostForUri(string $host): string
+    {
+        return str_contains($host, ':') && !str_starts_with($host, '[') ? "[$host]" : $host;
+    }
+
+    /**
      * Start a named process.
+     *
+     * The command's executable is looked up before anything is spawned, so a missing
+     * or non-executable command fails however slow the machine is. The process is then
+     * watched for the probe window and fails if it exits with code 126 or 127.
      *
      * @throws DevServerException If the process fails to start
      */
@@ -44,6 +179,8 @@ class ProcessManager
         string $name,
         string $command,
     ): int {
+        $this->assertExecutable($name, $command);
+
         $descriptors = [
             0 => ['pipe', 'r'],  // stdin
             1 => ['pipe', 'w'],  // stdout
@@ -76,40 +213,132 @@ class ProcessManager
 
         if (!$status['running'] && in_array($status['exitcode'], [126, 127], true)) {
             $this->stop($name);
-            throw DevServerException::processFailedToStart($name, $command);
+            throw DevServerException::processFailedToStart($name, $command, "exited with code {$status['exitcode']}");
         }
 
         return $pid;
     }
 
     /**
+     * Fail before spawning when the command's executable is missing or not executable.
+     *
+     * Only a plain leading word is checked: anything the shell has to interpret first
+     * (builtins and reserved words resolve fine; quoting and expansions are skipped) is
+     * left to the probe window.
+     *
+     * @throws DevServerException If the executable does not exist or cannot be executed
+     */
+    private function assertExecutable(
+        string $name,
+        string $command,
+    ): void {
+        $executable = $this->leadingExecutable($command);
+
+        if ($executable === null) {
+            return;
+        }
+
+        if (str_contains($executable, '/')) {
+            clearstatcache(true, $executable);
+
+            if (!file_exists($executable)) {
+                throw DevServerException::processFailedToStart($name, $command, "'$executable' does not exist");
+            }
+
+            if (!is_file($executable) || !is_executable($executable)) {
+                throw DevServerException::processFailedToStart($name, $command, "'$executable' is not executable");
+            }
+
+            return;
+        }
+
+        exec('command -v ' . escapeshellarg($executable) . ' 2>/dev/null', $lookup, $exitCode);
+
+        if ($exitCode !== 0) {
+            throw DevServerException::processFailedToStart(
+                $name,
+                $command,
+                "Executable '$executable' was not found in PATH",
+            );
+        }
+    }
+
+    /**
+     * The executable a command runs, skipping leading variable assignments, `exec` and `env`.
+     *
+     * Returns null when the shell would have to interpret the word first (quotes,
+     * expansions, operators, reserved words), because only the shell can resolve it.
+     */
+    private function leadingExecutable(string $command): ?string
+    {
+        $words = preg_split('/\s+/', trim($command), -1, PREG_SPLIT_NO_EMPTY);
+
+        foreach ($words === false ? [] : $words as $word) {
+            if ($word === 'exec' || $word === 'env') {
+                continue;
+            }
+
+            if (preg_match('/\A[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.\/:,@%+=-]*\z/', $word) === 1) {
+                continue;
+            }
+
+            if (preg_match('/\A[A-Za-z0-9_.\/+@%:,][A-Za-z0-9_.\/+@%:,-]*\z/', $word) !== 1
+                || in_array($word, self::SHELL_RESERVED_WORDS, true)
+            ) {
+                return null;
+            }
+
+            return $word;
+        }
+
+        return null;
+    }
+
+    /**
      * Start a named process in the background, fully detached from PHP.
      *
-     * Uses shell exec with output redirection instead of proc_open,
-     * so the process survives PHP exit. Returns the PID.
+     * The command runs under a small PHP supervisor that becomes the leader of a new
+     * session, so the process survives PHP exit and the returned PID leads its process
+     * group. The supervisor holds the command's stdin open (some tools, like
+     * tailwind --watch, exit when stdin closes), waits for it, and records its exit
+     * status. Any exit inside the probe window fails with the command's exit code.
+     *
+     * @throws DevServerException If the process fails to start or exits during the probe window
      */
     public function startDetached(
         string $name,
         string $command,
     ): int {
-        $wrappedCommand = $this->wrapWithNewProcessGroup($command);
-
-        // Start fully detached: pipe stdin from tail to keep it open (some tools
-        // like tailwind --watch exit when stdin closes), redirect output to
-        // /dev/null, and background the process.
-        $pid = (int) trim((string) shell_exec(
-            "tail -f /dev/null | $wrappedCommand > /dev/null 2>&1 & echo $!",
-        ));
-
-        if ($pid <= 0) {
-            throw DevServerException::processFailedToStart($name, $command);
+        if (!function_exists('posix_setsid') || !function_exists('posix_kill') || !function_exists('pcntl_waitpid')) {
+            throw new DevServerException(
+                message: "Cannot start process '$name' in detached mode: the posix and pcntl extensions are required",
+                context: 'While starting development services in detached mode',
+                suggestion: "Enable ext-posix and ext-pcntl, or run 'marko up --foreground'.",
+            );
         }
 
-        // Brief check to see if process died immediately
-        // (e.g. command not found, port in use)
-        usleep(150000); // 150ms
-        if (!$this->isDetachedRunning($pid)) {
-            throw DevServerException::processFailedToStart($name, $command);
+        $this->assertExecutable($name, $command);
+
+        $statusDirectory = $this->createStatusDirectory();
+        $statusFile = $statusDirectory . '/status';
+
+        try {
+            $pid = (int) trim((string) shell_exec(
+                $this->supervisorCommand($command, $statusFile) . ' < /dev/null > /dev/null 2>&1 & echo $!',
+            ));
+
+            if ($pid <= 0) {
+                throw DevServerException::processFailedToStart($name, $command);
+            }
+
+            $failure = $this->probeDetached($pid, $statusFile);
+        } finally {
+            $this->removeStatusDirectory($statusDirectory, $statusFile);
+        }
+
+        if ($failure !== null) {
+            @posix_kill(-$pid, self::SIGTERM);
+            throw DevServerException::processFailedToStart($name, $command, $failure);
         }
 
         $this->pids[$name] = $pid;
@@ -118,16 +347,119 @@ class ProcessManager
     }
 
     /**
+     * Watch a detached process group for the probe window.
+     *
+     * @return string|null Why the process failed to start, or null when it is still running
+     */
+    private function probeDetached(
+        int $pid,
+        string $statusFile,
+    ): ?string {
+        $deadline = microtime(true) + $this->startProbeSeconds;
+
+        while (true) {
+            $exitCode = $this->readExitStatus($statusFile);
+
+            if ($exitCode !== null && $exitCode !== 0) {
+                return "exited with code $exitCode";
+            }
+
+            if (!$this->isDetachedRunning($pid)) {
+                // The supervisor writes the status just before it exits, so read it once more
+                $exitCode = $this->readExitStatus($statusFile);
+
+                return $exitCode !== null ? "exited with code $exitCode" : 'exited during startup';
+            }
+
+            if (microtime(true) >= $deadline) {
+                return null;
+            }
+
+            usleep(self::POLL_INTERVAL_MICROS);
+        }
+    }
+
+    /**
+     * The exit code the supervisor recorded, or null while the command is still running.
+     */
+    private function readExitStatus(string $statusFile): ?int
+    {
+        clearstatcache(true, $statusFile);
+
+        if (!is_file($statusFile)) {
+            return null;
+        }
+
+        $status = trim((string) file_get_contents($statusFile));
+
+        return $status === '' ? null : (int) $status;
+    }
+
+    private function createStatusDirectory(): string
+    {
+        $directory = ($this->statusDirectory ?? sys_get_temp_dir())
+            . '/marko-devserver-' . bin2hex(random_bytes(8));
+
+        if (!$this->withoutWarnings(fn (): bool => mkdir($directory, 0700, true)) && !is_dir($directory)) {
+            throw new DevServerException(
+                message: "Cannot create the status directory $directory",
+                context: 'While starting development services in detached mode',
+                suggestion: 'Check that the system temp directory exists and is writable.',
+            );
+        }
+
+        return $directory;
+    }
+
+    /**
+     * Remove a status directory once the probe window is over.
+     *
+     * Without the directory, a status the supervisor writes later fails silently
+     * instead of leaving a file behind.
+     */
+    private function removeStatusDirectory(
+        string $directory,
+        string $statusFile,
+    ): void {
+        // A second pass covers a status written between removing the file and removing the directory
+        for ($attempt = 0; $attempt < 2 && is_dir($directory); $attempt++) {
+            $this->withoutWarnings(fn (): bool => unlink($statusFile));
+            $this->withoutWarnings(fn (): bool => rmdir($directory));
+            clearstatcache(true, $directory);
+        }
+    }
+
+    /**
+     * Build the shell command that starts the detached supervisor.
+     *
+     * The supervisor calls posix_setsid() so its PID leads a new session and process
+     * group, runs the command through /bin/sh with a stdin pipe it never writes to or
+     * closes, waits for the command, writes its exit status, and exits with it.
+     */
+    private function supervisorCommand(
+        string $command,
+        string $statusFile,
+    ): string {
+        // Use double quotes inside the PHP code to avoid escapeshellarg single-quote conflicts
+        $code = 'posix_setsid();'
+            . '$process = proc_open(["/bin/sh", "-c", base64_decode("' . base64_encode($command) . '")],'
+            . ' [0 => ["pipe", "r"], 1 => ["file", "/dev/null", "w"], 2 => ["file", "/dev/null", "w"]], $pipes);'
+            . 'if (!is_resource($process)) { exit(126); }'
+            . 'pcntl_waitpid(proc_get_status($process)["pid"], $status);'
+            . '$code = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : 128 + (int) pcntl_wtermsig($status);'
+            . '@file_put_contents(base64_decode("' . base64_encode($statusFile) . '"), (string) $code);'
+            . 'exit($code);';
+
+        return 'exec ' . escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg($code);
+    }
+
+    /**
      * Check if a detached process (or its process group) is still running.
      */
     private function isDetachedRunning(int $pid): bool
     {
-        if (!function_exists('posix_kill')) {
-            return false;
-        }
-
         try {
-            return @posix_kill(-$pid, 0) || posix_kill($pid, 0);
+            return @posix_kill(-$pid, 0) || @posix_kill($pid, 0);
         } catch (ValueError) {
             return false;
         }

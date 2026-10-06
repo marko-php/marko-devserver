@@ -48,4 +48,18 @@ if (!function_exists('devserverWaitUntil')) {
     {
         return sys_get_temp_dir() . '/marko-devserver-ready-' . bin2hex(random_bytes(6));
     }
+
+    /**
+     * The PID a test process wrote to a marker file, or 0 while the file is missing or still empty.
+     */
+    function devserverMarkerPid(string $marker): int
+    {
+        clearstatcache(true, $marker);
+
+        if (!is_file($marker)) {
+            return 0;
+        }
+
+        return (int) file_get_contents($marker);
+    }
 }

@@ -38,3 +38,17 @@ it('returns a unique marker path in the temp directory that does not exist yet',
         ->and($first)->not->toBe($second)
         ->and(file_exists($first))->toBeFalse();
 });
+
+it('reads the PID a test process wrote to a marker file, or 0 until it is written', function (): void {
+    $marker = devserverMarkerPath();
+
+    expect(devserverMarkerPid($marker))->toBe(0);
+
+    file_put_contents($marker, '');
+    expect(devserverMarkerPid($marker))->toBe(0);
+
+    file_put_contents($marker, '4242');
+    expect(devserverMarkerPid($marker))->toBe(4242);
+
+    unlink($marker);
+});

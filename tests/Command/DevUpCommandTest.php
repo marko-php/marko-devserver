@@ -24,8 +24,14 @@ class FakeProcessManager extends ProcessManager
 
     public bool $foregroundCalled = false;
 
-    /** @var array<string, bool> Override isRunning results per process name */
-    public array $runningOverrides = [];
+    /** Whether isPortAvailable() reports the port as free */
+    public bool $portAvailable = true;
+
+    /** Whether waitUntilAccepting() reports the server as accepting connections (false: it exited first) */
+    public bool $acceptsConnections = true;
+
+    /** @var list<array{0: string, 1: string, 2: int}> Calls to waitUntilAccepting() as [name, host, port] */
+    public array $waitedFor = [];
 
     /** @noinspection PhpMissingParentConstructorInspection - Test stub intentionally skips parent */
     public function __construct() {}
@@ -39,9 +45,21 @@ class FakeProcessManager extends ProcessManager
         return 12345;
     }
 
-    public function isRunning(string $name): bool
-    {
-        return $this->runningOverrides[$name] ?? true;
+    public function isPortAvailable(
+        string $host,
+        int $port,
+    ): bool {
+        return $this->portAvailable;
+    }
+
+    public function waitUntilAccepting(
+        string $name,
+        string $host,
+        int $port,
+    ): bool {
+        $this->waitedFor[] = [$name, $host, $port];
+
+        return $this->acceptsConnections;
     }
 
     public function startDetached(
@@ -864,30 +882,92 @@ it('suggests marko down in exception when services are already running', functio
     }
 });
 
-it('throws DevServerException when PHP server dies immediately after start in foreground mode', function (): void {
+it(
+    'throws DevServerException when PHP server exits before accepting connections in foreground mode',
+    function (): void {
+        ['command' => $command, 'processManager' => $pm] = createDevUpCommand([
+            'dev.port' => 8000,
+            'dev.detach' => false,
+        ]);
+        // The PHP server exits before it accepts a connection (it lost the bind)
+        $pm->acceptsConnections = false;
+        ['output' => $output] = createMemoryOutput();
+
+        $input = new Input(['marko', 'dev:up']);
+        $command->execute($input, $output);
+    },
+)->throws(DevServerException::class, 'Port 8000 is already in use');
+
+it('waits for the PHP server to accept connections in foreground mode', function (): void {
     ['command' => $command, 'processManager' => $pm] = createDevUpCommand([
-        'dev.port' => 8000,
+        'dev.port' => 8123,
+        'dev.host' => '127.0.0.1',
         'dev.detach' => false,
     ]);
-    // Simulate PHP server dying immediately (port in use)
-    $pm->runningOverrides['php'] = false;
     ['output' => $output] = createMemoryOutput();
 
-    $input = new Input(['marko', 'dev:up']);
-    $command->execute($input, $output);
-})->throws(DevServerException::class, 'Port 8000 is already in use');
+    $result = $command->execute(new Input(['marko', 'dev:up']), $output);
 
-it('does not throw when PHP server stays running after start in foreground mode', function (): void {
+    expect($result)->toBe(0)
+        ->and($pm->waitedFor)->toBe([['php', '127.0.0.1', 8123]])
+        ->and($pm->foregroundCalled)->toBeTrue();
+});
+
+it('does not wait for connections in detached mode', function (): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.detach' => true]);
+    ['output' => $output] = createMemoryOutput();
+
+    $command->execute(new Input(['marko', 'dev:up']), $output);
+
+    expect($pm->waitedFor)->toBe([])
+        ->and($pm->started)->toHaveKey('php');
+});
+
+it('throws portInUse before starting any process when the port is occupied', function (bool $detach): void {
     ['command' => $command, 'processManager' => $pm] = createDevUpCommand([
         'dev.port' => 8000,
-        'dev.detach' => false,
+        'dev.detach' => $detach,
+        'dev.processes' => ['worker' => 'php worker.php'],
     ]);
-    // PHP server stays alive (default behavior)
-    $pm->runningOverrides['php'] = true;
+    $pm->portAvailable = false;
     ['output' => $output] = createMemoryOutput();
 
-    $input = new Input(['marko', 'dev:up']);
-    $result = $command->execute($input, $output);
+    expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+        ->toThrow(DevServerException::class, 'Port 8000 is already in use')
+        ->and($pm->started)->toBe([]);
+})->with(['foreground' => [false], 'detached' => [true]]);
 
-    expect($result)->toBe(0);
+it('throws portInUse for an occupied port with the real process manager', function (): void {
+    $dir = sys_get_temp_dir() . '/marko-test-' . uniqid();
+    mkdir($dir . '/public', 0755, true);
+    file_put_contents($dir . '/public/index.php', '<?php');
+
+    $server = stream_socket_server('tcp://127.0.0.1:0');
+    $address = (string) stream_socket_get_name($server, false);
+    $port = (int) substr($address, (int) strrpos($address, ':') + 1);
+    ['output' => $output] = createMemoryOutput();
+
+    $command = new DevUpCommand(
+        config: new FakeConfigRepository(array_merge(CONFIG_DEFAULTS, [
+            'dev.host' => '127.0.0.1',
+            'dev.port' => $port,
+            'dev.detach' => false,
+        ])),
+        dockerDetector: new DockerDetector($dir),
+        frontendDetector: new FrontendDetector($dir),
+        pubsubDetector: new PubSubDetector(),
+        pidFile: new PidFile($dir),
+        processManager: new ProcessManager($output),
+        paths: new ProjectPaths($dir),
+    );
+
+    try {
+        expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+            ->toThrow(DevServerException::class, "Port $port is already in use");
+    } finally {
+        fclose($server);
+        unlink($dir . '/public/index.php');
+        rmdir($dir . '/public');
+        rmdir($dir);
+    }
 });
