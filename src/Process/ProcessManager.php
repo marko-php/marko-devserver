@@ -431,8 +431,11 @@ class ProcessManager
         $encoded = base64_encode($command);
         $php = PHP_BINARY;
 
+        // `exec` makes the wrapper replace the spawning shell, so the PID proc_open reports
+        // is the session leader. Shells such as dash fork a lone command instead of
+        // exec'ing it, which would leave a short-lived shell as the reported PID.
         // Use double quotes inside the PHP code to avoid escapeshellarg single-quote conflicts
-        return "$php -r " . escapeshellarg(
+        return "exec $php -r " . escapeshellarg(
             'posix_setsid();'
             . 'pcntl_exec("/bin/sh", ["-c", base64_decode("' . $encoded . '")]);',
         );

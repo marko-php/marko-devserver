@@ -239,6 +239,19 @@ it('correctly tracks PID for long-running processes', function (): void {
     $manager->stop('sleep');
 });
 
+it('makes the reported PID the leader of its own process group', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output);
+
+    // Shells that fork instead of exec'ing a lone command (e.g. dash as /bin/sh) must not
+    // leave a wrapper shell as the reported PID: stop() signals that PID's group
+    $pid = $manager->start('sleep', 'sleep 30');
+
+    expect(devserverWaitUntil(fn (): bool => posix_getpgid($pid) === $pid))->toBeTrue();
+
+    $manager->stop('sleep');
+});
+
 it('leaves no process in the group once stop returns', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
     $manager = new ProcessManager($output);
