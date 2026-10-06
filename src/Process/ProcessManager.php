@@ -27,10 +27,12 @@ class ProcessManager
 
     /**
      * @param float $stopTimeoutSeconds Grace period stop() gives a process group to exit after SIGTERM before sending SIGKILL
+     * @param float $startProbeSeconds How long start() watches a new process for an immediate "not found"/"not executable" exit
      */
     public function __construct(
         private readonly Output $output,
         private readonly float $stopTimeoutSeconds = 3.0,
+        private readonly float $startProbeSeconds = 0.15,
     ) {}
 
     /**
@@ -65,9 +67,13 @@ class ProcessManager
         $this->processes[$name] = ['resource' => $process, 'pipes' => $pipes];
         $this->pids[$name] = $pid;
 
-        // Wait briefly and check if the process exited immediately with an error
-        usleep(150000); // 150ms — allows setsid wrapper to start and fail
-        $status = proc_get_status($process);
+        // Watch the process for the probe window, returning early once it exits,
+        // and fail if it exited because the command was not found or not executable
+        $deadline = microtime(true) + $this->startProbeSeconds;
+        while (($status = proc_get_status($process))['running'] && microtime(true) < $deadline) {
+            usleep(self::POLL_INTERVAL_MICROS);
+        }
+
         if (!$status['running'] && in_array($status['exitcode'], [126, 127], true)) {
             $this->stop($name);
             throw DevServerException::processFailedToStart($name, $command);

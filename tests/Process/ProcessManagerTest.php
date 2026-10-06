@@ -72,10 +72,33 @@ it('detects when a process exits unexpectedly', function (): void {
 
 it('throws DevServerException when process fails to start', function (): void {
     $output = new Output(fopen('php://memory', 'r+'));
-    $manager = new ProcessManager($output);
+    // A generous probe window: start() returns as soon as the command fails, so this
+    // costs nothing on a fast machine and survives a slow one under parallel load
+    $manager = new ProcessManager($output, startProbeSeconds: 5.0);
 
     expect(fn () => $manager->start('bad', '/nonexistent-command-abc123'))
         ->toThrow(DevServerException::class);
+});
+
+it('detects a command that fails after the default probe window when given a longer one', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 5.0);
+
+    // Exits with "command not found" well after the 150ms default probe window
+    expect(fn () => $manager->start('slow-fail', 'sleep 0.4; exit 127'))
+        ->toThrow(DevServerException::class);
+});
+
+it('returns from start as soon as the process exits within the probe window', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, startProbeSeconds: 5.0);
+
+    $start = microtime(true);
+    $manager->start('echo', 'echo hello');
+
+    expect(microtime(true) - $start)->toBeLessThan(2.5);
+
+    $manager->stopAll();
 });
 
 it('prefixes output lines with process name', function (): void {
