@@ -11,6 +11,7 @@ use Marko\Core\Command\Input;
 use Marko\Core\Command\Output;
 use Marko\DevServer\Exceptions\DevServerException;
 use Marko\DevServer\Process\PidFile;
+use Marko\DevServer\Process\ServerHost;
 
 /** @noinspection PhpUnused */
 #[Command(name: 'dev:open', description: 'Open the running development server in a browser', aliases: ['open'])]
@@ -54,7 +55,9 @@ readonly class DevOpenCommand implements CommandInterface
             );
         }
 
-        $url = "http://localhost:$phpEntry->port";
+        // Wildcard addresses cannot be browsed to, and PID files from before the host was recorded have none
+        $host = $phpEntry->host !== null ? ServerHost::fromString($phpEntry->host)->forBrowser() : 'localhost';
+        $url = "http://$host:$phpEntry->port";
         $output->writeLine("Opening $url");
         ($this->opener)($url);
 

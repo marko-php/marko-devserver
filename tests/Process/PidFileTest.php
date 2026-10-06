@@ -218,3 +218,39 @@ it('reads process entries from JSON file', function (): void {
 
     removeDir($tmpDir);
 });
+
+it('stores and reads the host of a process entry', function (): void {
+    $tmpDir = sys_get_temp_dir() . '/pid-file-test-' . uniqid();
+    mkdir($tmpDir, 0755, true);
+    $pidFile = new PidFile($tmpDir);
+
+    $pidFile->write([
+        new ProcessEntry('php', 1234, 'php -S [::1]:8000', 8000, '2026-02-25T12:30:00+00:00', '::1'),
+        new ProcessEntry('vite', 5678, 'npm run dev', 0, '2026-02-25T12:30:00+00:00'),
+    ]);
+    $entries = $pidFile->read();
+
+    expect($entries[0]->host)->toBe('::1')
+        ->and($entries[1]->host)->toBeNull();
+
+    removeDir($tmpDir);
+});
+
+it('reads entries written without a host', function (): void {
+    $tmpDir = sys_get_temp_dir() . '/pid-file-test-' . uniqid();
+    mkdir($tmpDir . '/.marko', 0755, true);
+    file_put_contents($tmpDir . '/.marko/dev.json', json_encode(['processes' => [[
+        'name' => 'php',
+        'pid' => 1234,
+        'command' => 'php -S localhost:8000',
+        'port' => 8000,
+        'startedAt' => '2026-02-25T12:30:00+00:00',
+    ]]]));
+
+    $entries = new PidFile($tmpDir)->read();
+
+    expect($entries[0]->name)->toBe('php')
+        ->and($entries[0]->host)->toBeNull();
+
+    removeDir($tmpDir);
+});

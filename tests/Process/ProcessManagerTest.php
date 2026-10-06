@@ -455,19 +455,6 @@ it('creates a loud exception when a process cannot be stopped', function (): voi
 });
 
 /**
- * Stop a detached process group and wait until it is gone, so no process outlives the test.
- */
-function devserverStopDetached(int $pid): void
-{
-    @posix_kill(-$pid, SIGTERM);
-
-    if (!devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid))) {
-        @posix_kill(-$pid, SIGKILL);
-        devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid));
-    }
-}
-
-/**
  * A fresh, empty directory for the per-start status files of detached processes.
  */
 function devserverStatusDirectory(): string
@@ -606,35 +593,6 @@ it('leaves no keep-alive or status file behind once a detached process is stoppe
     }
 });
 
-/**
- * Listen on an ephemeral port, so tests never collide under --parallel.
- *
- * @return array{0: resource, 1: int}
- */
-function devserverListen(string $address = '127.0.0.1'): array
-{
-    $server = stream_socket_server("tcp://$address:0", $errno, $errstr);
-
-    if ($server === false) {
-        throw new RuntimeException("Cannot listen on $address: $errstr");
-    }
-
-    $name = (string) stream_socket_get_name($server, false);
-
-    return [$server, (int) substr($name, (int) strrpos($name, ':') + 1)];
-}
-
-/**
- * A port that was free a moment ago.
- */
-function devserverFreePort(): int
-{
-    [$server, $port] = devserverListen();
-    fclose($server);
-
-    return $port;
-}
-
 it('reports a port another process is listening on as unavailable', function (): void {
     $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')));
     [$server, $port] = devserverListen();
@@ -720,4 +678,114 @@ it('throws when the server neither accepts connections nor exits before the time
     } finally {
         $manager->stopAll();
     }
+});
+
+it('stops a detached process group with stop', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), startProbeSeconds: 0.2);
+    $marker = devserverMarkerPath();
+
+    $pid = $manager->startDetached('tree', "sleep 30 & echo \$! > $marker; wait");
+
+    try {
+        expect(devserverWaitUntil(fn (): bool => devserverMarkerPid($marker) > 0))->toBeTrue();
+        $childPid = devserverMarkerPid($marker);
+
+        $manager->stop('tree');
+
+        expect(devserverProcessGroupAlive($pid))->toBeFalse()
+            ->and(posix_kill($childPid, 0))->toBeFalse()
+            ->and($manager->getPid('tree'))->toBeNull();
+    } finally {
+        devserverStopDetached($pid);
+        @unlink($marker);
+    }
+});
+
+it('stops detached and attached processes together with stopAll', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), startProbeSeconds: 0.2);
+
+    $attached = $manager->start('attached', 'sleep 30');
+    $detached = $manager->startDetached('detached', 'sleep 30');
+
+    try {
+        $manager->stopAll();
+
+        expect(devserverProcessGroupAlive($attached))->toBeFalse()
+            ->and(devserverProcessGroupAlive($detached))->toBeFalse()
+            ->and($manager->getPids())->toBe([]);
+    } finally {
+        devserverStopDetached($detached);
+    }
+});
+
+it('escalates to SIGKILL for a detached process group that ignores SIGTERM', function (): void {
+    $manager = new ProcessManager(
+        new Output(fopen('php://memory', 'r+')),
+        stopTimeoutSeconds: 0.5,
+        startProbeSeconds: 0.2,
+    );
+    $marker = devserverMarkerPath();
+
+    $pid = $manager->startDetached('stubborn', "trap '' TERM; echo \$\$ > $marker; sleep 30");
+
+    try {
+        expect(devserverWaitUntil(fn (): bool => devserverMarkerPid($marker) > 0))->toBeTrue();
+        $shellPid = devserverMarkerPid($marker);
+
+        $manager->stop('stubborn');
+
+        expect(devserverProcessGroupAlive($pid))->toBeFalse()
+            ->and(posix_kill($shellPid, 0))->toBeFalse();
+    } finally {
+        devserverStopDetached($pid);
+        @unlink($marker);
+    }
+});
+
+it('leaves no process from a detached command that fails during the probe window', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), startProbeSeconds: 5.0);
+    $marker = devserverMarkerPath();
+
+    // The command leaves a child behind in its process group, then fails
+    expect(fn () => $manager->startDetached('leaky', "sleep 30 & echo \$! > $marker; sleep 0.2; exit 1"))
+        ->toThrow(DevServerException::class, 'exited with code 1');
+
+    $childPid = devserverMarkerPid($marker);
+    @unlink($marker);
+
+    expect($childPid)->toBeGreaterThan(0)
+        ->and(posix_kill($childPid, 0))->toBeFalse()
+        ->and($manager->getPid('leaky'))->toBeNull();
+});
+
+it('reports the exit code of an exited process and null while it runs', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), startProbeSeconds: 0.0);
+    $marker = devserverMarkerPath();
+
+    $manager->start('failing', "until [ -f $marker ]; do sleep 0.01; done; exit 3");
+
+    try {
+        expect($manager->getExitCode('failing'))->toBeNull();
+
+        touch($marker);
+
+        expect(devserverWaitUntil(fn (): bool => !$manager->isRunning('failing')))->toBeTrue()
+            ->and($manager->getExitCode('failing'))->toBe(3)
+            ->and($manager->getExitCode('unknown'))->toBeNull();
+    } finally {
+        $manager->stopAll();
+        @unlink($marker);
+    }
+});
+
+it('collects the unread output of a process', function (): void {
+    $manager = new ProcessManager(new Output(fopen('php://memory', 'r+')), startProbeSeconds: 0.0);
+
+    $manager->start('chatty', 'echo out; echo err >&2; exit 1');
+
+    expect(devserverWaitUntil(fn (): bool => !$manager->isRunning('chatty')))->toBeTrue()
+        ->and($manager->collectOutput('chatty'))->toBe("out\nerr")
+        ->and($manager->collectOutput('unknown'))->toBe('');
+
+    $manager->stopAll();
 });

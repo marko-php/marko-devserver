@@ -18,6 +18,8 @@ use Marko\DevServer\Exceptions\DevServerException;
 use Marko\DevServer\Process\PidFile;
 use Marko\DevServer\Process\ProcessEntry;
 use Marko\DevServer\Process\ProcessManager;
+use Marko\DevServer\Process\ServerHost;
+use Throwable;
 
 /** @noinspection PhpUnused */
 #[Command(
@@ -39,6 +41,11 @@ readonly class DevUpCommand implements CommandInterface
     ) {}
 
     /**
+     * Start every configured service, or none of them.
+     *
+     * If any service fails to start, every service started so far is stopped and the
+     * original error is rethrown.
+     *
      * @throws ConfigNotFoundException|DevServerException
      */
     public function execute(
@@ -47,20 +54,10 @@ readonly class DevUpCommand implements CommandInterface
     ): int {
         $port = (int) ($input->getOption('port') ?? $input->getOption('p') ?? $this->config->getInt('dev.port'));
         $foreground = $input->hasOption('foreground') || $input->hasOption('f');
-        $host = $input->getOption('host') ?? $this->config->getString('dev.host');
-
-        if (!preg_match('/\A[a-zA-Z0-9.\-:]+\z/', $host)) {
-            throw new DevServerException(
-                message: "Invalid host value: '$host'",
-                suggestion: 'Use a valid hostname or IP address, e.g. --host=0.0.0.0 or --host=localhost',
-            );
-        }
+        $host = ServerHost::fromString($input->getOption('host') ?? $this->config->getString('dev.host'));
         $detach = !$foreground && ($input->hasOption('detach') || $input->hasOption('d') || $this->config->getBool(
             'dev.detach',
         ));
-        $dockerConfig = $this->config->get('dev.docker');
-        $frontendConfig = $this->config->get('dev.frontend');
-        $pubsubConfig = $this->config->get('dev.pubsub');
 
         // Guard: check if services are already running
         $existingEntries = $this->pidFile->read();
@@ -90,111 +87,23 @@ readonly class DevUpCommand implements CommandInterface
         }
 
         // Fail before starting anything if the PHP server's port is already taken
-        if (!$this->processManager->isPortAvailable($host, $port)) {
+        if (!$this->processManager->isPortAvailable($host->address, $port)) {
             throw DevServerException::portInUse($port);
         }
 
         $output->writeLine('Starting development environment...');
 
-        $entries = [];
-        $startProcess = $detach
-            ? $this->processManager->startDetached(...)
-            : $this->processManager->start(...);
+        try {
+            $entries = $this->startServices($output, $detach, $host, $port);
 
-        // Docker
-        if ($dockerConfig !== false) {
-            $dockerCommand = is_string($dockerConfig)
-                ? $dockerConfig
-                : $this->dockerDetector->detect()['upCommand'] ?? null;
-
-            if ($dockerCommand !== null) {
-                $output->writeLine("  Starting Docker: $dockerCommand");
-                $pid = $startProcess('docker', $dockerCommand);
-                $entries[] = new ProcessEntry(
-                    name: 'docker',
-                    pid: $pid,
-                    command: $dockerCommand,
-                    port: 0,
-                    startedAt: date('c'),
-                );
+            if ($detach) {
+                $this->pidFile->write($entries);
             }
+        } catch (Throwable $e) {
+            $this->rollBack($output, $e);
         }
-
-        // Frontend
-        if ($frontendConfig !== false) {
-            $frontendCommand = is_string($frontendConfig)
-                ? $frontendConfig
-                : $this->frontendDetector->detect();
-
-            if ($frontendCommand !== null) {
-                $output->writeLine("  Starting frontend: $frontendCommand");
-                $pid = $startProcess('frontend', $frontendCommand);
-                $entries[] = new ProcessEntry(
-                    name: 'frontend',
-                    pid: $pid,
-                    command: $frontendCommand,
-                    port: 0,
-                    startedAt: date('c'),
-                );
-            }
-        }
-
-        // Pub/Sub listener
-        if ($pubsubConfig !== false) {
-            $pubsubCommand = is_string($pubsubConfig)
-                ? $pubsubConfig
-                : $this->pubsubDetector->detect();
-
-            if ($pubsubCommand !== null) {
-                $output->writeLine("  Starting pub/sub listener: $pubsubCommand");
-                $pid = $startProcess('pubsub', $pubsubCommand);
-                $entries[] = new ProcessEntry(
-                    name: 'pubsub',
-                    pid: $pid,
-                    command: $pubsubCommand,
-                    port: 0,
-                    startedAt: date('c'),
-                );
-            }
-        }
-
-        // Custom processes
-        /** @var array<string, string> $processes */
-        $processes = $this->config->get('dev.processes');
-        foreach ($processes as $name => $processCommand) {
-            $output->writeLine("  Starting $name: $processCommand");
-            $pid = $startProcess($name, $processCommand);
-            $entries[] = new ProcessEntry(
-                name: $name,
-                pid: $pid,
-                command: $processCommand,
-                port: 0,
-                startedAt: date('c'),
-            );
-        }
-
-        // PHP server (always) — multiple workers needed for SSE
-        $phpCommand = "env PHP_CLI_SERVER_WORKERS=4 php -S $host:$port -t public/";
-        $output->writeLine("  Starting PHP server: php -S $host:$port");
-        $pid = $startProcess('php', $phpCommand);
-
-        // In foreground mode, wait until the PHP server accepts connections. If it exits
-        // first, it lost the bind (the port was taken after the check above).
-        // In detached mode, startDetached() already fails on any exit during its probe window.
-        if (!$detach && !$this->processManager->waitUntilAccepting('php', $host, $port)) {
-            throw DevServerException::portInUse($port);
-        }
-
-        $entries[] = new ProcessEntry(
-            name: 'php',
-            pid: $pid,
-            command: $phpCommand,
-            port: $port,
-            startedAt: date('c'),
-        );
 
         if ($detach) {
-            $this->pidFile->write($entries);
             $output->writeLine('Development environment started in background.');
             $output->writeLine("Run 'marko dev:status' to check status.");
             $output->writeLine("Run 'marko dev:down' to stop.");
@@ -204,5 +113,146 @@ readonly class DevUpCommand implements CommandInterface
         }
 
         return 0;
+    }
+
+    /**
+     * Start Docker, the frontend, the pub/sub listener, custom processes and the PHP server, in that order.
+     *
+     * @return list<ProcessEntry>
+     * @throws ConfigNotFoundException|DevServerException
+     */
+    private function startServices(
+        Output $output,
+        bool $detach,
+        ServerHost $host,
+        int $port,
+    ): array {
+        $entries = [];
+        $startProcess = $detach
+            ? $this->processManager->startDetached(...)
+            : $this->processManager->start(...);
+
+        $start = function (string $name, string $command, string $label) use ($output, $startProcess, &$entries): void {
+            $output->writeLine("  Starting $label: $command");
+            $pid = $startProcess($name, $command);
+            $entries[] = new ProcessEntry(
+                name: $name,
+                pid: $pid,
+                command: $command,
+                port: 0,
+                startedAt: date('c'),
+            );
+        };
+
+        // Docker
+        $dockerConfig = $this->config->get('dev.docker');
+        if ($dockerConfig !== false) {
+            $dockerCommand = is_string($dockerConfig)
+                ? $dockerConfig
+                : $this->dockerDetector->detect()['upCommand'] ?? null;
+
+            if ($dockerCommand !== null) {
+                $start('docker', $dockerCommand, 'Docker');
+            }
+        }
+
+        // Frontend
+        $frontendConfig = $this->config->get('dev.frontend');
+        if ($frontendConfig !== false) {
+            $frontendCommand = is_string($frontendConfig)
+                ? $frontendConfig
+                : $this->frontendDetector->detect();
+
+            if ($frontendCommand !== null) {
+                $start('frontend', $frontendCommand, 'frontend');
+            }
+        }
+
+        // Pub/Sub listener
+        $pubsubConfig = $this->config->get('dev.pubsub');
+        if ($pubsubConfig !== false) {
+            $pubsubCommand = is_string($pubsubConfig)
+                ? $pubsubConfig
+                : $this->pubsubDetector->detect();
+
+            if ($pubsubCommand !== null) {
+                $start('pubsub', $pubsubCommand, 'pub/sub listener');
+            }
+        }
+
+        // Custom processes
+        /** @var array<string, string> $processes */
+        $processes = $this->config->get('dev.processes');
+        foreach ($processes as $name => $processCommand) {
+            $start((string) $name, $processCommand, (string) $name);
+        }
+
+        // PHP server (always) — multiple workers needed for SSE
+        $address = $host->forUri() . ":$port";
+        $phpCommand = "env PHP_CLI_SERVER_WORKERS=4 php -S $address -t public/";
+        $output->writeLine("  Starting PHP server: php -S $address");
+        $pid = $startProcess('php', $phpCommand);
+
+        // In foreground mode, wait until the PHP server accepts connections.
+        // In detached mode, startDetached() already fails on any exit during its probe window.
+        if (!$detach && !$this->processManager->waitUntilAccepting('php', $host->address, $port)) {
+            throw $this->serverExitedException($host, $port);
+        }
+
+        $entries[] = new ProcessEntry(
+            name: 'php',
+            pid: $pid,
+            command: $phpCommand,
+            port: $port,
+            startedAt: date('c'),
+            host: $host->address,
+        );
+
+        return $entries;
+    }
+
+    /**
+     * Explain why the PHP server exited before it accepted a connection.
+     *
+     * It lost the bind when the port is taken now (another process grabbed it after the
+     * check before startup). Anything else — an address that is not local, a syntax
+     * error, a missing extension — is reported with the server's exit code and output.
+     */
+    private function serverExitedException(
+        ServerHost $host,
+        int $port,
+    ): DevServerException {
+        $exitCode = $this->processManager->getExitCode('php');
+        $serverOutput = $this->processManager->collectOutput('php');
+
+        if (!$this->processManager->isPortAvailable($host->address, $port)) {
+            return DevServerException::portInUse($port);
+        }
+
+        return DevServerException::serverExited($host->address, $port, $exitCode, $serverOutput);
+    }
+
+    /**
+     * Stop every service started so far, then rethrow the failure.
+     *
+     * A PID file left by an earlier run is removed too: the guard above has already
+     * confirmed none of its processes are running.
+     *
+     * @throws DevServerException|Throwable
+     */
+    private function rollBack(
+        Output $output,
+        Throwable $failure,
+    ): never {
+        $output->writeLine('Startup failed. Stopping the services that already started...');
+        $this->pidFile->clear();
+
+        try {
+            $this->processManager->stopAll();
+        } catch (DevServerException) {
+            throw DevServerException::rollbackFailed($failure, $this->processManager->getPids());
+        }
+
+        throw $failure;
     }
 }

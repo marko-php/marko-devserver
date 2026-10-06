@@ -34,6 +34,7 @@ class PidFile
             'command' => $e->command,
             'port' => $e->port,
             'startedAt' => $e->startedAt,
+            'host' => $e->host,
         ], $entries);
 
         file_put_contents($this->filePath, json_encode(['processes' => $data], JSON_PRETTY_PRINT));
@@ -63,6 +64,8 @@ class PidFile
             command: $p['command'],
             port: $p['port'],
             startedAt: $p['startedAt'],
+            // PID files written before the host was recorded have no host key
+            host: $p['host'] ?? null,
         ), $data['processes']);
     }
 

@@ -28,8 +28,11 @@ class ProcessManager
     /** @var array<string, array{resource: resource, pipes: array<int, resource>}> */
     private array $processes = [];
 
-    /** @var array<string, int> */
+    /** @var array<string, int> Every running process this manager started, in start order */
     private array $pids = [];
+
+    /** @var array<string, int> Processes started with startDetached(), which have no proc_open() resource */
+    private array $detached = [];
 
     /**
      * @param float $stopTimeoutSeconds Grace period stop() gives a process group to exit after SIGTERM before sending SIGKILL
@@ -62,7 +65,7 @@ class ProcessManager
 
         $errno = 0;
         $errstr = '';
-        $address = 'tcp://' . $this->hostForUri($host) . ":$port";
+        $address = 'tcp://' . ServerHost::formatForUri($host) . ":$port";
         $server = $this->withoutWarnings(
             function () use ($address, &$errno, &$errstr): mixed {
                 return stream_socket_server($address, $errno, $errstr);
@@ -127,7 +130,7 @@ class ProcessManager
         };
 
         $connection = $this->withoutWarnings(fn (): mixed => stream_socket_client(
-            'tcp://' . $this->hostForUri($connectHost) . ":$port",
+            'tcp://' . ServerHost::formatForUri($connectHost) . ":$port",
             timeout: $timeoutSeconds,
         ));
 
@@ -156,14 +159,6 @@ class ProcessManager
         } finally {
             restore_error_handler();
         }
-    }
-
-    /**
-     * Bracket IPv6 literals so they can be used in a stream URI.
-     */
-    private function hostForUri(string $host): string
-    {
-        return str_contains($host, ':') && !str_starts_with($host, '[') ? "[$host]" : $host;
     }
 
     /**
@@ -212,7 +207,7 @@ class ProcessManager
         }
 
         if (!$status['running'] && in_array($status['exitcode'], [126, 127], true)) {
-            $this->stop($name);
+            $this->stopAfterFailedStart($name);
             throw DevServerException::processFailedToStart($name, $command, "exited with code {$status['exitcode']}");
         }
 
@@ -336,12 +331,13 @@ class ProcessManager
             $this->removeStatusDirectory($statusDirectory, $statusFile);
         }
 
+        $this->detached[$name] = $pid;
+        $this->pids[$name] = $pid;
+
         if ($failure !== null) {
-            @posix_kill(-$pid, self::SIGTERM);
+            $this->stopAfterFailedStart($name);
             throw DevServerException::processFailedToStart($name, $command, $failure);
         }
-
-        $this->pids[$name] = $pid;
 
         return $pid;
     }
@@ -472,15 +468,31 @@ class ProcessManager
      * all of them to exit, then escalates to SIGKILL. When this returns, the
      * process and its group are gone.
      *
+     * Works the same for processes started with start() and with startDetached().
+     *
      * @throws DevServerException If the process group survives SIGKILL
      */
     public function stop(string $name): void
     {
-        if (!isset($this->processes[$name])) {
+        if (!isset($this->pids[$name])) {
             return;
         }
 
         $this->terminate([$name]);
+    }
+
+    /**
+     * Stop a process whose start just failed, without letting a stop failure hide why it failed.
+     *
+     * A group that survives stays tracked, so a later stop() or stopAll() reports it.
+     */
+    private function stopAfterFailedStart(string $name): void
+    {
+        try {
+            $this->stop($name);
+        } catch (DevServerException) {
+            // The start failure is the error to report; the survivor is still tracked
+        }
     }
 
     /**
@@ -508,15 +520,17 @@ class ProcessManager
             }
 
             // Close pipes only once the group is gone, so nothing gets SIGPIPE while shutting down
-            foreach ($this->processes[$name]['pipes'] as $pipe) {
-                if (is_resource($pipe)) {
-                    fclose($pipe);
+            if (isset($this->processes[$name])) {
+                foreach ($this->processes[$name]['pipes'] as $pipe) {
+                    if (is_resource($pipe)) {
+                        fclose($pipe);
+                    }
                 }
+
+                proc_close($this->processes[$name]['resource']);
             }
 
-            proc_close($this->processes[$name]['resource']);
-
-            unset($this->processes[$name], $this->pids[$name]);
+            unset($this->processes[$name], $this->detached[$name], $this->pids[$name]);
         }
 
         if ($remaining !== []) {
@@ -532,7 +546,7 @@ class ProcessManager
         int $signal,
     ): void {
         foreach ($names as $name) {
-            $this->signal($this->processes[$name]['resource'], $this->pids[$name], $signal);
+            $this->signal($name, $signal);
         }
     }
 
@@ -542,22 +556,48 @@ class ProcessManager
      * Both are signalled because the process may not have become a group
      * leader yet (it is killed before posix_setsid() runs), and because
      * children in the group outlive a leader that exits on its own.
-     *
-     * @param resource $process
      */
     private function signal(
-        mixed $process,
-        int $pid,
+        string $name,
         int $signal,
     ): void {
+        $pid = $this->pids[$name];
+
+        if (!isset($this->processes[$name])) {
+            // A detached supervisor leads its own group once posix_setsid() ran; before that, only its PID reaches it
+            try {
+                @posix_kill(-$pid, $signal) || @posix_kill($pid, $signal);
+            } catch (ValueError) {
+                // The process is already gone
+            }
+
+            return;
+        }
+
         if (function_exists('posix_kill')) {
             @posix_kill(-$pid, $signal);
         }
+
+        $process = $this->processes[$name]['resource'];
 
         // Once reaped, the PID may be reused by an unrelated process — only signal a live child
         if (proc_get_status($process)['running']) {
             proc_terminate($process, $signal);
         }
+    }
+
+    /**
+     * Whether a process or any process in its group is still alive.
+     */
+    private function isAlive(string $name): bool
+    {
+        if (!isset($this->processes[$name])) {
+            return $this->isDetachedRunning($this->pids[$name]);
+        }
+
+        // proc_get_status() reaps the exited process, so a zombie never counts as running
+        return proc_get_status($this->processes[$name]['resource'])['running']
+            || $this->isProcessGroupAlive($this->pids[$name]);
     }
 
     /**
@@ -573,12 +613,7 @@ class ProcessManager
         $deadline = microtime(true) + $timeoutSeconds;
 
         while (true) {
-            $names = array_values(array_filter(
-                $names,
-                // proc_get_status() reaps the exited process, so a zombie never counts as running
-                fn (string $name): bool => proc_get_status($this->processes[$name]['resource'])['running']
-                    || $this->isProcessGroupAlive($this->pids[$name]),
-            ));
+            $names = array_values(array_filter($names, $this->isAlive(...)));
 
             if ($names === [] || microtime(true) >= $deadline) {
                 return $names;
@@ -603,19 +638,21 @@ class ProcessManager
     /**
      * Stop all managed processes.
      *
-     * Every process group gets SIGTERM up front, so their grace periods overlap
-     * instead of adding up one service at a time.
+     * Covers processes started with start() and with startDetached(). Every process
+     * group gets SIGTERM up front, newest first, so their grace periods overlap
+     * instead of adding up one service at a time. Processes that are gone are
+     * released even when another one survives; the survivors stay in getPids().
      *
      * @throws DevServerException If a process group survives SIGKILL
      */
     public function stopAll(): void
     {
-        if ($this->processes === []) {
+        if ($this->pids === []) {
             return;
         }
 
         // PHP turns numeric-string array keys into ints, so cast names back to strings
-        $this->terminate(array_map(strval(...), array_keys($this->processes)));
+        $this->terminate(array_reverse(array_map(strval(...), array_keys($this->pids))));
     }
 
     /**
@@ -675,7 +712,7 @@ class ProcessManager
             foreach (array_keys($this->processes) as $name) {
                 if (!$this->isRunning($name)) {
                     $this->drainOutput($name);
-                    $exitCode = $this->getExitCode($name);
+                    $exitCode = $this->getExitCode($name) ?? -1;
                     if ($exitCode !== 0) {
                         $this->writePrefix($name, "exited with code $exitCode");
                     } else {
@@ -696,17 +733,43 @@ class ProcessManager
     }
 
     /**
-     * Get the exit code of a process, or -1 if unknown.
+     * Get the exit code of a process started with start().
+     *
+     * @return int|null The exit code, or null while the process runs or when it is not tracked
      */
-    private function getExitCode(string $name): int
+    public function getExitCode(string $name): ?int
     {
         if (!isset($this->processes[$name])) {
-            return -1;
+            return null;
         }
 
         $status = proc_get_status($this->processes[$name]['resource']);
 
-        return $status['exitcode'];
+        return $status['running'] || $status['exitcode'] === -1 ? null : $status['exitcode'];
+    }
+
+    /**
+     * Read the output of a process started with start() that has not been streamed yet.
+     *
+     * Returns stdout followed by stderr, trimmed. Call it before stop(), which closes the pipes.
+     */
+    public function collectOutput(string $name): string
+    {
+        if (!isset($this->processes[$name])) {
+            return '';
+        }
+
+        $output = '';
+
+        foreach ([1, 2] as $fd) {
+            $pipe = $this->processes[$name]['pipes'][$fd];
+
+            if (is_resource($pipe)) {
+                $output .= (string) stream_get_contents($pipe);
+            }
+        }
+
+        return trim($output);
     }
 
     /**

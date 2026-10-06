@@ -62,4 +62,78 @@ if (!function_exists('devserverWaitUntil')) {
 
         return (int) file_get_contents($marker);
     }
+
+    /**
+     * Stop a detached process group and wait until it is gone, so no process outlives the test.
+     */
+    function devserverStopDetached(int $pid): void
+    {
+        @posix_kill(-$pid, SIGTERM);
+
+        if (!devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid))) {
+            @posix_kill(-$pid, SIGKILL);
+            devserverWaitUntil(fn (): bool => !devserverProcessGroupAlive($pid));
+        }
+    }
+
+    /**
+     * Listen on an ephemeral port, so tests never collide under --parallel.
+     *
+     * @return array{0: resource, 1: int}
+     */
+    function devserverListen(string $address = '127.0.0.1'): array
+    {
+        $server = stream_socket_server("tcp://$address:0", $errno, $errstr);
+
+        if ($server === false) {
+            throw new RuntimeException("Cannot listen on $address: $errstr");
+        }
+
+        $name = (string) stream_socket_get_name($server, false);
+
+        return [$server, (int) substr($name, (int) strrpos($name, ':') + 1)];
+    }
+
+    /**
+     * A port that was free a moment ago.
+     *
+     * @param string $address The address to probe, with IPv6 literals bracketed
+     */
+    function devserverFreePort(string $address = '127.0.0.1'): int
+    {
+        [$server, $port] = devserverListen($address);
+        fclose($server);
+
+        return $port;
+    }
+
+    /**
+     * The body of a GET request, or false while nothing answers (without a warning PHPUnit would report).
+     */
+    function devserverHttpGet(string $url): string|false
+    {
+        set_error_handler(static fn (): bool => true);
+
+        try {
+            return file_get_contents($url);
+        } finally {
+            restore_error_handler();
+        }
+    }
+
+    /**
+     * Whether this machine can listen on the IPv6 loopback address.
+     */
+    function devserverHasIpv6Loopback(): bool
+    {
+        $server = @stream_socket_server('tcp://[::1]:0');
+
+        if ($server === false) {
+            return false;
+        }
+
+        fclose($server);
+
+        return true;
+    }
 }

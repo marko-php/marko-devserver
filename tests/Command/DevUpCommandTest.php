@@ -30,8 +30,27 @@ class FakeProcessManager extends ProcessManager
     /** Whether waitUntilAccepting() reports the server as accepting connections (false: it exited first) */
     public bool $acceptsConnections = true;
 
+    /** Whether isPortAvailable() reports the port as free once the PHP server exited (null: same as $portAvailable) */
+    public ?bool $portAvailableAfterExit = null;
+
+    /** @var list<array{0: string, 1: int}> Calls to isPortAvailable() as [host, port] */
+    public array $portChecks = [];
+
     /** @var list<array{0: string, 1: string, 2: int}> Calls to waitUntilAccepting() as [name, host, port] */
     public array $waitedFor = [];
+
+    /** The process whose start fails with processFailedToStart, or null */
+    public ?string $failOn = null;
+
+    /** What getExitCode() and collectOutput() report for the PHP server */
+    public ?int $exitCode = null;
+
+    public string $output = '';
+
+    /** @var array<string, int> Processes stopAll() fails to stop, as name => PID */
+    public array $survivors = [];
+
+    public int $stopAllCalls = 0;
 
     /** @noinspection PhpMissingParentConstructorInspection - Test stub intentionally skips parent */
     public function __construct() {}
@@ -40,6 +59,17 @@ class FakeProcessManager extends ProcessManager
         string $name,
         string $command,
     ): int {
+        return $this->record($name, $command);
+    }
+
+    private function record(
+        string $name,
+        string $command,
+    ): int {
+        if ($name === $this->failOn) {
+            throw DevServerException::processFailedToStart($name, $command);
+        }
+
         $this->started[$name] = $command;
 
         return 12345;
@@ -49,7 +79,38 @@ class FakeProcessManager extends ProcessManager
         string $host,
         int $port,
     ): bool {
-        return $this->portAvailable;
+        $this->portChecks[] = [$host, $port];
+
+        return count($this->portChecks) > 1 && $this->portAvailableAfterExit !== null
+            ? $this->portAvailableAfterExit
+            : $this->portAvailable;
+    }
+
+    public function stopAll(): void
+    {
+        $this->stopAllCalls++;
+
+        if ($this->survivors !== []) {
+            throw DevServerException::processFailedToStop(
+                (string) array_key_first($this->survivors),
+                reset($this->survivors),
+            );
+        }
+    }
+
+    public function getPids(): array
+    {
+        return $this->survivors;
+    }
+
+    public function getExitCode(string $name): ?int
+    {
+        return $this->exitCode;
+    }
+
+    public function collectOutput(string $name): string
+    {
+        return $this->output;
     }
 
     public function waitUntilAccepting(
@@ -66,9 +127,7 @@ class FakeProcessManager extends ProcessManager
         string $name,
         string $command,
     ): int {
-        $this->started[$name] = $command;
-
-        return 12345;
+        return $this->record($name, $command);
     }
 
     public function runForeground(): void
@@ -464,13 +523,34 @@ it('overrides config host with --host flag', function (): void {
         ->and($pm->started['php'])->not->toContain('localhost');
 });
 
-it('rejects invalid host values', function (): void {
-    ['command' => $command] = createDevUpCommand(['dev.host' => 'localhost']);
+it('rejects invalid host values', function (string $host): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.host' => 'localhost']);
     ['output' => $output] = createMemoryOutput();
 
-    $input = new Input(['marko', 'dev:up', '--host=0.0.0.0; evil']);
-    $command->execute($input, $output);
-})->throws(DevServerException::class, 'Invalid host value');
+    expect(fn () => $command->execute(new Input(['marko', 'dev:up', "--host=$host"]), $output))
+        ->toThrow(DevServerException::class, "Invalid host value: '$host'")
+        ->and($pm->started)->toBe([]);
+})->with(['0.0.0.0; evil', '[localhost]', '::1::2', 'localhost:8000']);
+
+it('brackets a bare or bracketed IPv6 host in the PHP server command', function (string $host): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand();
+    ['stream' => $stream, 'output' => $output] = createMemoryOutput();
+
+    $command->execute(new Input(['marko', 'dev:up', "--host=$host"]), $output);
+
+    expect($pm->started['php'])->toBe('env PHP_CLI_SERVER_WORKERS=4 php -S [::1]:8000 -t public/')
+        ->and(readStream($stream))->toContain('Starting PHP server: php -S [::1]:8000');
+})->with(['::1', '[::1]']);
+
+it('passes the unbracketed IPv6 host to the port check and the readiness wait', function (): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.detach' => false]);
+    ['output' => $output] = createMemoryOutput();
+
+    $command->execute(new Input(['marko', 'dev:up', '--host=[::1]']), $output);
+
+    expect($pm->portChecks)->toBe([['::1', 8000]])
+        ->and($pm->waitedFor)->toBe([['php', '::1', 8000]]);
+});
 
 it('overrides config port with -p space syntax', function (): void {
     ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.port' => 8000]);
@@ -883,14 +963,15 @@ it('suggests marko down in exception when services are already running', functio
 });
 
 it(
-    'throws DevServerException when PHP server exits before accepting connections in foreground mode',
+    'reports portInUse when the PHP server exits because the port was taken',
     function (): void {
         ['command' => $command, 'processManager' => $pm] = createDevUpCommand([
             'dev.port' => 8000,
             'dev.detach' => false,
         ]);
-        // The PHP server exits before it accepts a connection (it lost the bind)
+        // The PHP server exits before it accepts a connection: it lost the bind to another process
         $pm->acceptsConnections = false;
+        $pm->portAvailableAfterExit = false;
         ['output' => $output] = createMemoryOutput();
 
         $input = new Input(['marko', 'dev:up']);
@@ -969,5 +1050,341 @@ it('throws portInUse for an occupied port with the real process manager', functi
         unlink($dir . '/public/index.php');
         rmdir($dir . '/public');
         rmdir($dir);
+    }
+});
+
+it(
+    'stops the services it started and rethrows the original error when a service fails',
+    function (bool $detach): void {
+        ['command' => $command, 'processManager' => $pm] = createDevUpCommand([
+            'dev.detach' => $detach,
+            'dev.frontend' => 'yarn dev',
+            'dev.processes' => ['queue' => 'php marko queue:work'],
+        ]);
+        $pm->failOn = 'queue';
+        ['stream' => $stream, 'output' => $output] = createMemoryOutput();
+
+        expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+            ->toThrow(DevServerException::class, "Failed to start process 'queue'")
+            ->and($pm->stopAllCalls)->toBe(1)
+            ->and($pm->started)->not->toHaveKey('php')
+            ->and(readStream($stream))->toContain('Stopping the services that already started');
+    },
+)->with(['foreground' => [false], 'detached' => [true]]);
+
+it('does not stop anything when it fails before starting a service', function (): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand();
+    $pm->portAvailable = false;
+    ['output' => $output] = createMemoryOutput();
+
+    expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+        ->toThrow(DevServerException::class, 'Port 8000 is already in use')
+        ->and($pm->stopAllCalls)->toBe(0);
+});
+
+it('throws a DevServerException naming the survivors when the rollback fails', function (): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.frontend' => 'yarn dev']);
+    $pm->failOn = 'php';
+    $pm->survivors = ['frontend' => 4321];
+    ['output' => $output] = createMemoryOutput();
+
+    try {
+        $command->execute(new Input(['marko', 'dev:up']), $output);
+        expect(false)->toBeTrue('Expected DevServerException was not thrown');
+    } catch (DevServerException $e) {
+        expect($e->getMessage())->toContain("'frontend' (PID 4321)")
+            ->and($e->getPrevious())->toBeInstanceOf(DevServerException::class)
+            ->and($e->getPrevious()?->getMessage())->toContain("Failed to start process 'php'");
+    }
+});
+
+it('removes a stale PID file when the start fails', function (bool $detach): void {
+    $dir = sys_get_temp_dir() . '/marko-stale-' . uniqid();
+    mkdir($dir, 0755, true);
+    $pidFile = new PidFile($dir);
+    $pidFile->write([new ProcessEntry('php', 99999, 'php -S localhost:8000', 8000, '2026-02-25T10:00:00+00:00')]);
+
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.detach' => $detach], $dir);
+    $pm->failOn = 'php';
+    ['output' => $output] = createMemoryOutput();
+
+    expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+        ->toThrow(DevServerException::class)
+        ->and($pidFile->read())->toBe([]);
+})->with(['foreground' => [false], 'detached' => [true]]);
+
+it('reports a PHP server that exits before accepting connections with its exit code and output', function (): void {
+    ['command' => $command, 'processManager' => $pm] = createDevUpCommand(['dev.detach' => false]);
+    $pm->acceptsConnections = false;
+    $pm->exitCode = 255;
+    $pm->output = 'PHP Parse error: syntax error in public/router.php';
+    ['output' => $output] = createMemoryOutput();
+
+    try {
+        $command->execute(new Input(['marko', 'dev:up']), $output);
+        expect(false)->toBeTrue('Expected DevServerException was not thrown');
+    } catch (DevServerException $e) {
+        expect($e->getMessage())
+            ->toBe('PHP server exited with code 255 before accepting connections on localhost:8000')
+            ->and($e->getContext())->toContain('PHP Parse error')
+            ->and($pm->stopAllCalls)->toBe(1);
+    }
+});
+
+/**
+ * A ProcessManager that remembers the PID of every process it started, so tests can check they are gone.
+ */
+class RecordingProcessManager extends ProcessManager
+{
+    /** @var array<string, int> */
+    public array $startedPids = [];
+
+    public function start(
+        string $name,
+        string $command,
+    ): int {
+        return $this->startedPids[$name] = parent::start($name, $command);
+    }
+
+    public function startDetached(
+        string $name,
+        string $command,
+    ): int {
+        return $this->startedPids[$name] = parent::startDetached($name, $command);
+    }
+
+    /**
+     * These tests expect startup to fail; reaching the foreground loop would block until the services exit.
+     */
+    public function runForeground(): void
+    {
+        $this->stopAll();
+
+        throw new RuntimeException('dev:up reached runForeground(): startup was expected to fail');
+    }
+}
+
+/**
+ * Build a DevUpCommand with the real process manager in a fresh project directory.
+ *
+ * @param array<string, mixed> $config
+ * @param float $startProbeSeconds How long each start is watched for an early exit
+ * @return array{command: DevUpCommand, processManager: RecordingProcessManager, pidFile: PidFile, dir: string, output: Output}
+ */
+function createRealDevUpCommand(
+    array $config,
+    float $startProbeSeconds = 0.2,
+): array {
+    $dir = sys_get_temp_dir() . '/marko-real-' . bin2hex(random_bytes(6));
+    mkdir($dir . '/public', 0755, true);
+    file_put_contents($dir . '/public/index.php', '<?php echo "marko-ok";');
+
+    ['output' => $output] = createMemoryOutput();
+    $processManager = new RecordingProcessManager($output, startProbeSeconds: $startProbeSeconds);
+    $pidFile = new PidFile($dir);
+
+    $command = new DevUpCommand(
+        config: new FakeConfigRepository(array_merge(CONFIG_DEFAULTS, $config)),
+        dockerDetector: new DockerDetector($dir),
+        frontendDetector: new FrontendDetector($dir),
+        pubsubDetector: new PubSubDetector(),
+        pidFile: $pidFile,
+        processManager: $processManager,
+        paths: new ProjectPaths($dir),
+    );
+
+    return [
+        'command' => $command,
+        'processManager' => $processManager,
+        'pidFile' => $pidFile,
+        'dir' => $dir,
+        'output' => $output,
+    ];
+}
+
+/**
+ * Run a command from the project directory, as `marko up` does, so `php -S -t public/` finds the docroot.
+ */
+function runInProject(
+    string $dir,
+    callable $callback,
+): void {
+    $cwd = (string) getcwd();
+    chdir($dir);
+
+    try {
+        $callback();
+    } finally {
+        chdir($cwd);
+    }
+}
+
+it(
+    'stops services already started when a later service fails to start with the real process manager',
+    function (bool $detach): void {
+        [
+            'command' => $command,
+            'processManager' => $pm,
+            'pidFile' => $pidFile,
+            'dir' => $dir,
+            'output' => $output,
+        ] = createRealDevUpCommand([
+            'dev.host' => '127.0.0.1',
+            'dev.port' => devserverFreePort(),
+            'dev.detach' => $detach,
+            'dev.processes' => [
+                'first' => 'sleep 30',
+                'second' => 'sleep 30',
+                // A missing executable fails before anything is spawned, however slow the machine is
+                'broken' => 'nonexistent-binary-abc123 --watch',
+            ],
+        ]);
+
+        try {
+            runInProject($dir, function () use ($command, $output): void {
+                expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+                    ->toThrow(DevServerException::class, "Failed to start process 'broken'");
+            });
+
+            expect($pm->startedPids)->toHaveKeys(['first', 'second'])
+                ->and(devserverProcessGroupAlive($pm->startedPids['first']))->toBeFalse()
+                ->and(devserverProcessGroupAlive($pm->startedPids['second']))->toBeFalse()
+                ->and($pm->getPids())->toBe([])
+                ->and($pidFile->read())->toBe([]);
+        } finally {
+            array_map(devserverStopDetached(...), $pm->startedPids);
+        }
+    },
+)->with(['foreground' => [false], 'detached' => [true]]);
+
+it(
+    'stops services already started when the PHP server fails to start with the real process manager',
+    function (bool $detach): void {
+        // Detached mode only notices an exit inside the probe window, so give a slow machine time;
+        // the failing server ends the window early
+        [
+            'command' => $command,
+            'processManager' => $pm,
+            'pidFile' => $pidFile,
+            'dir' => $dir,
+            'output' => $output,
+        ] = createRealDevUpCommand([
+            // TEST-NET-1 (RFC 5737) is never a local address, so the PHP server cannot bind it and exits
+            'dev.host' => '192.0.2.1',
+            'dev.port' => devserverFreePort(),
+            'dev.detach' => $detach,
+            'dev.processes' => ['worker' => 'sleep 30'],
+        ], startProbeSeconds: $detach ? 5.0 : 0.2);
+
+        try {
+            runInProject($dir, function () use ($command, $output, $detach): void {
+                expect(fn () => $command->execute(new Input(['marko', 'dev:up']), $output))
+                    ->toThrow(
+                        DevServerException::class,
+                        $detach ? "Failed to start process 'php'" : 'PHP server exited with code 1 before accepting connections on 192.0.2.1',
+                    );
+            });
+
+            expect(devserverProcessGroupAlive($pm->startedPids['worker']))->toBeFalse()
+                ->and($pm->getPids())->toBe([])
+                ->and($pidFile->read())->toBe([]);
+        } finally {
+            array_map(devserverStopDetached(...), $pm->startedPids);
+        }
+    },
+)->with(['foreground' => [false], 'detached' => [true]]);
+
+it('includes the PHP server output when it exits before accepting connections', function (): void {
+    [
+        'command' => $command,
+        'processManager' => $pm,
+        'dir' => $dir,
+        'output' => $output,
+    ] = createRealDevUpCommand([
+        'dev.host' => '192.0.2.1',
+        'dev.port' => devserverFreePort(),
+        'dev.detach' => false,
+    ]);
+
+    try {
+        runInProject($dir, function () use ($command, $output): void {
+            try {
+                $command->execute(new Input(['marko', 'dev:up']), $output);
+                expect(false)->toBeTrue('Expected DevServerException was not thrown');
+            } catch (DevServerException $e) {
+                expect($e->getContext())->toContain('Failed to listen on 192.0.2.1');
+            }
+        });
+    } finally {
+        array_map(devserverStopDetached(...), $pm->startedPids);
+    }
+});
+
+it('serves requests on the IPv6 loopback for a bare or bracketed host', function (string $host): void {
+    if (!devserverHasIpv6Loopback()) {
+        $this->markTestSkipped('This machine has no IPv6 loopback address');
+    }
+
+    $port = devserverFreePort('[::1]');
+    [
+        'command' => $command,
+        'processManager' => $pm,
+        'pidFile' => $pidFile,
+        'dir' => $dir,
+        'output' => $output,
+    ] = createRealDevUpCommand(['dev.port' => $port, 'dev.detach' => true]);
+
+    try {
+        runInProject($dir, function () use ($command, $output, $host): void {
+            expect($command->execute(new Input(['marko', 'dev:up', "--host=$host"]), $output))->toBe(0);
+        });
+
+        $body = null;
+        $served = devserverWaitUntil(function () use ($port, &$body): bool {
+            $body = devserverHttpGet("http://[::1]:$port/");
+
+            return $body !== false;
+        }, timeoutSeconds: 15.0);
+
+        expect($pidFile->read()[0]->command)->toContain("php -S [::1]:$port")
+            ->and($pidFile->read()[0]->host)->toBe('::1')
+            ->and($served)->toBeTrue()
+            ->and($body)->toBe('marko-ok');
+    } finally {
+        array_map(devserverStopDetached(...), $pm->startedPids);
+    }
+})->with(['::1', '[::1]']);
+
+it('binds all IPv6 interfaces for the :: host', function (): void {
+    if (!devserverHasIpv6Loopback()) {
+        $this->markTestSkipped('This machine has no IPv6 loopback address');
+    }
+
+    $port = devserverFreePort('[::1]');
+    [
+        'command' => $command,
+        'processManager' => $pm,
+        'pidFile' => $pidFile,
+        'dir' => $dir,
+        'output' => $output,
+    ] = createRealDevUpCommand(['dev.port' => $port, 'dev.detach' => true]);
+
+    try {
+        runInProject($dir, function () use ($command, $output): void {
+            expect($command->execute(new Input(['marko', 'dev:up', '--host=::']), $output))->toBe(0);
+        });
+
+        $body = null;
+        $served = devserverWaitUntil(function () use ($port, &$body): bool {
+            $body = devserverHttpGet("http://[::1]:$port/");
+
+            return $body !== false;
+        }, timeoutSeconds: 15.0);
+
+        expect($pidFile->read()[0]->command)->toContain("php -S [::]:$port")
+            ->and($served)->toBeTrue()
+            ->and($body)->toBe('marko-ok');
+    } finally {
+        array_map(devserverStopDetached(...), $pm->startedPids);
     }
 });

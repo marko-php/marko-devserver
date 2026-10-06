@@ -161,3 +161,29 @@ it('finds the PHP server among multiple processes', function (): void {
 
     devOpenRemoveDir($tmpDir);
 });
+
+it('opens the recorded host of the PHP server', function (?string $host, string $url): void {
+    $tmpDir = devOpenTmpDir();
+    $pidFile = new PidFile($tmpDir);
+    $pidFile->write([
+        new ProcessEntry('php', getmypid(), 'php -S HOST:8000', 8000, '2026-02-25T10:00:00+00:00', $host),
+    ]);
+
+    $openedUrl = null;
+    $command = new DevOpenCommand($pidFile, function (string $url) use (&$openedUrl): void {
+        $openedUrl = $url;
+    });
+
+    $command->execute(new Input([]), new Output(fopen('php://memory', 'r+')));
+
+    expect($openedUrl)->toBe($url);
+
+    devOpenRemoveDir($tmpDir);
+})->with([
+    'hostname' => ['app.test', 'http://app.test:8000'],
+    'IPv4 address' => ['127.0.0.1', 'http://127.0.0.1:8000'],
+    'IPv4 wildcard' => ['0.0.0.0', 'http://localhost:8000'],
+    'IPv6 wildcard' => ['::', 'http://localhost:8000'],
+    'IPv6 loopback' => ['::1', 'http://[::1]:8000'],
+    'entry written before hosts were recorded' => [null, 'http://localhost:8000'],
+]);
