@@ -65,10 +65,7 @@ it('detects when a process exits unexpectedly', function (): void {
 
     $manager->start('echo', 'echo hello');
 
-    // Give the short-lived process time to complete
-    usleep(100000); // 100ms
-
-    expect($manager->isRunning('echo'))->toBeFalse();
+    expect(devserverWaitUntil(fn (): bool => !$manager->isRunning('echo')))->toBeTrue();
 
     $manager->stopAll();
 });
@@ -199,10 +196,9 @@ it('reports stopped processes as stopped in dev:status', function (): void {
     $pid = $manager->start('sleep', 'sleep 10');
     $manager->stop('sleep');
 
-    // After stop, the process should no longer be alive
-    // Give the OS a moment to clean up
-    usleep(50000);
-    expect(posix_kill($pid, 0))->toBeFalse();
+    // stop() only returns once the process and its group are gone, so no wait is needed
+    expect(posix_kill($pid, 0))->toBeFalse()
+        ->and(devserverProcessGroupAlive($pid))->toBeFalse();
 });
 
 it('correctly tracks PID for long-running processes', function (): void {
@@ -211,12 +207,122 @@ it('correctly tracks PID for long-running processes', function (): void {
 
     $pid = $manager->start('sleep', 'sleep 30');
 
-    // Wait a bit to ensure any shell wrapper has had time to exit
-    usleep(100000); // 100ms
-
-    // The PID must still be the running process (not a dead shell wrapper)
-    expect(posix_kill($pid, 0))->toBeTrue()
+    // Wait until the setsid wrapper has exec'd into its own process group
+    expect(devserverWaitUntil(fn (): bool => devserverProcessGroupAlive($pid)))->toBeTrue()
+        // The PID must still be the running process (not a dead shell wrapper)
+        ->and(posix_kill($pid, 0))->toBeTrue()
         ->and($pid)->toBe($manager->getPid('sleep'));
 
     $manager->stop('sleep');
+});
+
+it('leaves no process in the group once stop returns', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output);
+
+    $pid = $manager->start('sleep', 'sleep 30');
+    expect(devserverWaitUntil(fn (): bool => devserverProcessGroupAlive($pid)))->toBeTrue();
+
+    $manager->stop('sleep');
+
+    expect(devserverProcessGroupAlive($pid))->toBeFalse()
+        ->and($manager->isRunning('sleep'))->toBeFalse();
+});
+
+it('stops child processes that share the process group', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output);
+
+    $marker = devserverMarkerPath();
+
+    // The shell leader backgrounds a child in the same process group and records its PID
+    $pid = $manager->start('tree', "sleep 30 & echo \$! > $marker; wait");
+    expect(devserverWaitUntil(fn (): bool => (int) @file_get_contents($marker) > 0))->toBeTrue();
+    $childPid = (int) file_get_contents($marker);
+    @unlink($marker);
+
+    expect(posix_kill($childPid, 0))->toBeTrue();
+
+    $manager->stop('tree');
+
+    expect(devserverProcessGroupAlive($pid))->toBeFalse()
+        ->and(posix_kill($childPid, 0))->toBeFalse();
+});
+
+it('escalates to SIGKILL when a process ignores SIGTERM', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, stopTimeoutSeconds: 0.5);
+    $marker = devserverMarkerPath();
+
+    // Ignore SIGTERM (inherited by the sleep child), then signal readiness via a marker file
+    $pid = $manager->start('stubborn', "trap '' TERM; touch $marker; sleep 30");
+    expect(devserverWaitUntil(fn (): bool => file_exists($marker)))->toBeTrue();
+
+    $manager->stop('stubborn');
+    @unlink($marker);
+
+    expect(devserverProcessGroupAlive($pid))->toBeFalse()
+        ->and(posix_kill($pid, 0))->toBeFalse();
+});
+
+it('returns within the stop timeout when a process ignores SIGTERM', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, stopTimeoutSeconds: 0.5);
+    $marker = devserverMarkerPath();
+
+    $manager->start('stubborn', "trap '' TERM; touch $marker; sleep 30");
+    expect(devserverWaitUntil(fn (): bool => file_exists($marker)))->toBeTrue();
+
+    $start = microtime(true);
+    $manager->stop('stubborn');
+    $elapsed = microtime(true) - $start;
+    @unlink($marker);
+
+    // 0.5s grace period plus a bounded wait for SIGKILL to land — never the 30s sleep
+    expect($elapsed)->toBeGreaterThanOrEqual(0.5)
+        ->and($elapsed)->toBeLessThan(5.0);
+});
+
+it('stops a process that has already exited without waiting', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, stopTimeoutSeconds: 5.0);
+
+    $manager->start('echo', 'echo hello');
+    expect(devserverWaitUntil(fn (): bool => !$manager->isRunning('echo')))->toBeTrue();
+
+    $start = microtime(true);
+    $manager->stop('echo');
+
+    expect(microtime(true) - $start)->toBeLessThan(1.0)
+        ->and($manager->getPid('echo'))->toBeNull();
+});
+
+it('overlaps the stop grace periods of all processes in stopAll', function (): void {
+    $output = new Output(fopen('php://memory', 'r+'));
+    $manager = new ProcessManager($output, stopTimeoutSeconds: 1.0);
+    $markerA = devserverMarkerPath();
+    $markerB = devserverMarkerPath();
+
+    $manager->start('a', "trap '' TERM; touch $markerA; sleep 30");
+    $manager->start('b', "trap '' TERM; touch $markerB; sleep 30");
+    expect(devserverWaitUntil(fn (): bool => file_exists($markerA) && file_exists($markerB)))->toBeTrue();
+
+    $start = microtime(true);
+    $manager->stopAll();
+    $elapsed = microtime(true) - $start;
+    @unlink($markerA);
+    @unlink($markerB);
+
+    // Stopping one after the other would take at least 2 x 1.0s
+    expect($elapsed)->toBeLessThan(2.0)
+        ->and($manager->getPids())->toBeEmpty();
+});
+
+it('creates a loud exception when a process cannot be stopped', function (): void {
+    $exception = DevServerException::processFailedToStop('php', 12345);
+
+    expect($exception->getMessage())->toContain("'php'")
+        ->and($exception->getMessage())->toContain('12345')
+        ->and($exception->getContext())->not->toBeEmpty()
+        ->and($exception->getSuggestion())->toContain('kill -9 -12345');
 });

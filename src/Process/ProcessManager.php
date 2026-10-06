@@ -10,14 +10,27 @@ use ValueError;
 
 class ProcessManager
 {
+    private const int SIGTERM = 15;
+
+    private const int SIGKILL = 9;
+
+    /** How long to wait for SIGKILL to take effect before failing loudly. */
+    private const float KILL_TIMEOUT_SECONDS = 2.0;
+
+    private const int POLL_INTERVAL_MICROS = 10_000;
+
     /** @var array<string, array{resource: resource, pipes: array<int, resource>}> */
     private array $processes = [];
 
     /** @var array<string, int> */
     private array $pids = [];
 
+    /**
+     * @param float $stopTimeoutSeconds Grace period stop() gives a process group to exit after SIGTERM before sending SIGKILL
+     */
     public function __construct(
         private readonly Output $output,
+        private readonly float $stopTimeoutSeconds = 3.0,
     ) {}
 
     /**
@@ -115,7 +128,13 @@ class ProcessManager
     }
 
     /**
-     * Stop a named process.
+     * Stop a named process and every process in its process group.
+     *
+     * Sends SIGTERM to the process and its group, waits up to the stop timeout for
+     * all of them to exit, then escalates to SIGKILL. When this returns, the
+     * process and its group are gone.
+     *
+     * @throws DevServerException If the process group survives SIGKILL
      */
     public function stop(string $name): void
     {
@@ -123,30 +142,142 @@ class ProcessManager
             return;
         }
 
-        $process = $this->processes[$name]['resource'];
-        $pipes = $this->processes[$name]['pipes'];
+        $this->terminate([$name]);
+    }
 
-        // Close pipes
-        foreach ($pipes as $pipe) {
-            if (is_resource($pipe)) {
-                fclose($pipe);
+    /**
+     * Terminate the named processes and their process groups, then release them.
+     *
+     * All groups share one SIGTERM grace period, so stopping several services
+     * takes as long as the slowest one rather than the sum of all of them.
+     *
+     * @param list<string> $names
+     * @throws DevServerException If a process group survives SIGKILL
+     */
+    private function terminate(array $names): void
+    {
+        $remaining = $this->waitForExit($names, 0.0);
+        $this->signalAll($remaining, self::SIGTERM);
+
+        $remaining = $this->waitForExit($remaining, $this->stopTimeoutSeconds);
+        $this->signalAll($remaining, self::SIGKILL);
+
+        $remaining = $this->waitForExit($remaining, self::KILL_TIMEOUT_SECONDS);
+
+        foreach ($names as $name) {
+            if (in_array($name, $remaining, true)) {
+                continue;
             }
+
+            // Close pipes only once the group is gone, so nothing gets SIGPIPE while shutting down
+            foreach ($this->processes[$name]['pipes'] as $pipe) {
+                if (is_resource($pipe)) {
+                    fclose($pipe);
+                }
+            }
+
+            proc_close($this->processes[$name]['resource']);
+
+            unset($this->processes[$name], $this->pids[$name]);
         }
 
-        proc_terminate($process);
-        proc_close($process);
+        if ($remaining !== []) {
+            throw DevServerException::processFailedToStop($remaining[0], $this->pids[$remaining[0]]);
+        }
+    }
 
-        unset($this->processes[$name], $this->pids[$name]);
+    /**
+     * @param list<string> $names
+     */
+    private function signalAll(
+        array $names,
+        int $signal,
+    ): void {
+        foreach ($names as $name) {
+            $this->signal($this->processes[$name]['resource'], $this->pids[$name], $signal);
+        }
+    }
+
+    /**
+     * Send a signal to a process and to its process group.
+     *
+     * Both are signalled because the process may not have become a group
+     * leader yet (it is killed before posix_setsid() runs), and because
+     * children in the group outlive a leader that exits on its own.
+     *
+     * @param resource $process
+     */
+    private function signal(
+        mixed $process,
+        int $pid,
+        int $signal,
+    ): void {
+        if (function_exists('posix_kill')) {
+            @posix_kill(-$pid, $signal);
+        }
+
+        // Once reaped, the PID may be reused by an unrelated process — only signal a live child
+        if (proc_get_status($process)['running']) {
+            proc_terminate($process, $signal);
+        }
+    }
+
+    /**
+     * Poll until every named process has exited and its process group is empty, or the timeout passes.
+     *
+     * @param list<string> $names
+     * @return list<string> The names still alive when the timeout passed
+     */
+    private function waitForExit(
+        array $names,
+        float $timeoutSeconds,
+    ): array {
+        $deadline = microtime(true) + $timeoutSeconds;
+
+        while (true) {
+            $names = array_values(array_filter(
+                $names,
+                // proc_get_status() reaps the exited process, so a zombie never counts as running
+                fn (string $name): bool => proc_get_status($this->processes[$name]['resource'])['running']
+                    || $this->isProcessGroupAlive($this->pids[$name]),
+            ));
+
+            if ($names === [] || microtime(true) >= $deadline) {
+                return $names;
+            }
+
+            usleep(self::POLL_INTERVAL_MICROS);
+        }
+    }
+
+    /**
+     * Check if any process in the process group led by the given PID is still alive.
+     */
+    private function isProcessGroupAlive(int $pgid): bool
+    {
+        if (!function_exists('posix_kill')) {
+            return false;
+        }
+
+        return @posix_kill(-$pgid, 0);
     }
 
     /**
      * Stop all managed processes.
+     *
+     * Every process group gets SIGTERM up front, so their grace periods overlap
+     * instead of adding up one service at a time.
+     *
+     * @throws DevServerException If a process group survives SIGKILL
      */
     public function stopAll(): void
     {
-        foreach (array_keys($this->processes) as $name) {
-            $this->stop($name);
+        if ($this->processes === []) {
+            return;
         }
+
+        // PHP turns numeric-string array keys into ints, so cast names back to strings
+        $this->terminate(array_map(strval(...), array_keys($this->processes)));
     }
 
     /**
